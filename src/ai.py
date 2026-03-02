@@ -151,3 +151,34 @@ def ai_extract_structured(items: List[Dict[str, str]]) -> Dict[str, Any]:
     system = {"role": "system", "content": "Return valid JSON only. No markdown."}
     txt = _groq_chat([system, user], max_tokens=2200, temperature=0.2)
     return _parse_json_strict(txt)
+
+def ai_parse_edgar_last_private_round(filing_text: str, context: dict) -> dict:
+    """
+    filing_text: extracted EDGAR text (limited, relevant sections preferred)
+    context: {company_name?, ticker?, filing_url?}
+    Returns JSON with last private round info.
+    """
+    system = {"role": "system", "content": "Return valid JSON only. No markdown."}
+    user = {
+        "role": "user",
+        "content": f"""
+You are reading a biotech IPO registration statement excerpt.
+Goal: identify the LAST private preferred financing round price per share.
+
+Return STRICT JSON with keys:
+- last_private_round_price_per_share (number or null)
+- currency ("USD" if unknown)
+- round_date (string or null)
+- security (string or null)  // e.g. "Series C Preferred"
+- supporting_quote (string)  // exact quote used (<= 40 words)
+- confidence (0 to 1)
+- reasoning (string) // 1 short sentence
+
+Context: {json.dumps(context)}
+
+Filing text:
+\"\"\"{filing_text[:9000]}\"\"\"
+"""
+    }
+    txt = _groq_chat([system, user], max_tokens=650, temperature=0.1)
+    return _parse_json_strict(txt)
