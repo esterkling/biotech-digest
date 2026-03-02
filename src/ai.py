@@ -48,25 +48,18 @@ def _groq_chat(
     return r.json()["choices"][0]["message"]["content"].strip()
 
 
-def _parse_json_strict(text: str) -> Any:
+def _extract_first_json_block(text: str) -> str:
     """
-    Models sometimes return extra text before/after JSON.
-    This extracts the first JSON object/array.
+    Extract the first {...} or [...] block from a string.
     """
     text = (text or "").strip()
-
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
     start = None
     for i, ch in enumerate(text):
         if ch in "{[":
             start = i
             break
     if start is None:
-        raise ValueError(f"No JSON start found in model response: {text[:200]}")
+        raise ValueError(f"No JSON start found. First 200 chars:\n{text[:200]}")
 
     end = None
     for j in range(len(text) - 1, -1, -1):
@@ -74,9 +67,60 @@ def _parse_json_strict(text: str) -> Any:
             end = j + 1
             break
     if end is None or end <= start:
-        raise ValueError(f"No JSON end found in model response: {text[:200]}")
+        raise ValueError(f"No JSON end found. First 200 chars:\n{text[:200]}")
 
-    return json.loads(text[start:end])
+    return text[start:end]
+
+
+def _repair_json_with_groq(bad_json: str) -> str:
+    """
+    Ask Groq to repair invalid JSON into valid JSON.
+    One extra call only when needed.
+    """
+    system = {"role": "system", "content": "You fix JSON. Return ONLY valid JSON. No commentary."}
+    user = {
+        "role": "user",
+        "content": (
+            "Fix this so it becomes strictly valid JSON. "
+            "Do not change the data meaning. Return JSON only.\n\n"
+            f"{bad_json}"
+        ),
+    }
+    return _groq_chat([system, user], max_tokens=1400, temperature=0.0)
+
+
+def _parse_json_strict(text: str, *, repair: bool = True) -> Any:
+    """
+    Parse model output as JSON.
+    If parsing fails and repair=True, ask Groq to repair the JSON once.
+    """
+    text = (text or "").strip()
+
+    # 1) direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # 2) extract first JSON block and parse
+    try:
+        block = _extract_first_json_block(text)
+        return json.loads(block)
+    except Exception as e1:
+        if not repair:
+            raise
+
+    # 3) repair once via Groq, then parse again
+    try:
+        repaired = _repair_json_with_groq(_extract_first_json_block(text))
+        repaired_block = _extract_first_json_block(repaired)
+        return json.loads(repaired_block)
+    except Exception as e2:
+        # Raise a helpful error (won't be huge)
+        raise ValueError(
+            "Failed to parse JSON even after repair.\n"
+            f"Original (first 300 chars): {text[:300]}\n"
+        ) from e2
 
 
 # ----------------------------
@@ -102,7 +146,7 @@ def ai_cluster_headlines(items: List[Dict[str, str]]) -> Dict[str, Any]:
     }
 
     txt = _groq_chat([system, user], max_tokens=1600, temperature=0.0)
-    data = _parse_json_strict(txt)
+    data = _parse_json_strict(txt, repair=True)
 
     clusters = data.get("clusters") if isinstance(data, dict) else None
     if not isinstance(clusters, list):
@@ -124,6 +168,10 @@ def ai_cluster_headlines(items: List[Dict[str, str]]) -> Dict[str, Any]:
                 "label": str(c.get("label") or "")[:120],
             }
         )
+
+    # Safety: if model returns nothing usable, treat as no clustering
+    if not cleaned:
+        return {"clusters": []}
 
     return {"clusters": cleaned}
 
@@ -164,7 +212,7 @@ def ai_extract_structured(items: List[Dict[str, str]]) -> Dict[str, Any]:
     }
 
     txt = _groq_chat([system, user], max_tokens=2200, temperature=0.2)
-    data = _parse_json_strict(txt)
+    data = _parse_json_strict(txt, repair=True)
 
     items_out = data.get("items") if isinstance(data, dict) else None
     if not isinstance(items_out, list):
@@ -222,12 +270,9 @@ def ai_extract_structured(items: List[Dict[str, str]]) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Compatibility single-item helper
+# Compatibility single-item helper (in case older code imports it)
 # ----------------------------
 def ai_summarize_takeaway(title: str, url: str, category: str, article_text: str) -> dict:
-    """
-    Backwards compatible wrapper: returns summary + vc_takeaway + materiality.
-    """
     snippet = (article_text or "").strip().replace("\n", " ")
     snippet = snippet[:1200]
 
@@ -247,46 +292,31 @@ def ai_summarize_takeaway(title: str, url: str, category: str, article_text: str
 
 
 # ----------------------------
-# IPO / EDGAR AI parser (needed by src/edgar.py)
+# IPO / EDGAR AI parser (used by src/edgar.py if you wired it)
 # ----------------------------
 def ai_parse_edgar_last_private_round(filing_text: str, context: dict) -> dict:
-    """
-    Parse an S-1/F-1/424B4 excerpt and identify the last private preferred financing round price/share.
-    Returns:
-      {
-        last_private_round_price_per_share: number|null,
-        currency: "USD",
-        round_date: string|null,
-        security: string|null,
-        supporting_quote: string,
-        confidence: 0..1,
-        reasoning: string
-      }
-    """
     system = {"role": "system", "content": "Return valid JSON only. No markdown."}
     user = {
         "role": "user",
         "content": f"""
 You are reading an IPO registration statement excerpt (S-1/F-1/424B4).
-Goal: identify the LAST private preferred financing round price per share (not option exercises, not conversions unless clearly the priced round).
+Goal: identify the LAST private preferred financing round price per share.
 
 Return STRICT JSON with keys:
 - last_private_round_price_per_share (number or null)
 - currency ("USD" if unknown)
 - round_date (string or null)
-- security (string or null)  // e.g. "Series C Preferred"
-- supporting_quote (string)  // exact quote used (<= 40 words)
+- security (string or null)
+- supporting_quote (string)  // <= 40 words
 - confidence (number from 0 to 1)
 - reasoning (string) // 1 short sentence
 
-If not enough info, set price to null and lower confidence.
+Context: {json.dumps(context)}
 
-Context (may be partial): {json.dumps(context)}
-
-Filing text (may be truncated):
+Filing text:
 \"\"\"{(filing_text or '')[:9000]}\"\"\"
 """.strip(),
     }
 
     txt = _groq_chat([system, user], max_tokens=700, temperature=0.1)
-    return _parse_json_strict(txt)
+    return _parse_json_strict(txt, repair=True)
