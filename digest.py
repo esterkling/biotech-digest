@@ -17,6 +17,32 @@ from src.edgar import (
     edgar_private_price_analysis_from_company,
 )
 
+# -----------------------
+# Quality controls (BLOCKLIST approach)
+# -----------------------
+BLOCKED_DOMAINS = {
+    # low-signal / spammy / clickbait finance wrappers
+    "stocktitan.net",
+    "investing.com",       # mostly analyst notes / price targets
+    "marketscreener.com",
+    "seekingalpha.com",
+    "benzinga.com",
+    "zacks.com",
+    "tipranks.com",
+    "simplywall.st",
+
+    # misc/low relevance that leaked in your example
+    "mva.org",
+    "newsonair.gov.in",
+    "medwatch.com",
+    "businessreport.co.za",
+
+    # google wrapper (we want the underlying source)
+    "news.google.com",
+
+    # any other recurring low-quality sources you notice
+    "parameter.io",
+}
 
 # -----------------------
 # Scheduling / gating
@@ -31,8 +57,15 @@ def is_force_send() -> bool:
 
 
 # -----------------------
-# Slack formatting
+# Helpers
 # -----------------------
+def host_from_url(url: str) -> str:
+    try:
+        return url.split("/")[2].lower()
+    except Exception:
+        return ""
+
+
 def slack_link(url: str, title: str) -> str:
     title = (title or "").replace("\n", " ").strip()
     if len(title) > 95:
@@ -40,15 +73,9 @@ def slack_link(url: str, title: str) -> str:
     return f"<{url}|{title}>"
 
 
-def slack_plain(url: str, label: str = "alt") -> str:
-    return f"<{url}|{label}>"
-
-
-def host_from_url(url: str) -> str:
-    try:
-        return url.split("/")[2].lower()
-    except Exception:
-        return ""
+def slack_source_link(url: str) -> str:
+    host = host_from_url(url) or "source"
+    return f"<{url}|{host}>"
 
 
 def section_name(ai_category: str) -> str:
@@ -86,35 +113,26 @@ _RESURFACED_PHRASES = [
     "already announced",
     "reiterated",
     "recap",
-    "in a note",
     "analysis",
-    "what it means",
     "explainer",
     "background",
     "context",
+    "in a note",
 ]
 
-# e.g. "announced on Feb. 27" / "announced on February 27"
 _ANNOUNCED_ON_DATE_RE = re.compile(
     r"\bannounced\s+on\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\.?\s+\d{1,2}\b",
     re.IGNORECASE,
 )
 
 def is_resurfaced_deal(text: str) -> bool:
-    """
-    Returns True if the article snippet strongly suggests it is discussing
-    an earlier-announced deal rather than reporting a newly announced one.
-    """
     if not text:
         return False
     t = text.lower()
-
     if any(p in t for p in _RESURFACED_PHRASES):
         return True
-
     if _ANNOUNCED_ON_DATE_RE.search(text):
         return True
-
     return False
 
 
@@ -186,12 +204,12 @@ def build_clusters(raw_items: list[dict]) -> tuple[list[dict], dict[int, list[in
 
 def build_structured(
     reps: list[dict],
-    snippet_chars: int = 1400,
+    snippet_chars: int = 1600,
     max_items: int = 30,
 ) -> tuple[dict[int, dict], dict[int, str]]:
     """
     One batch call: categorization + one-line summary + VC takeaway.
-    Also returns snippet_by_id so we can apply "resurfaced deal" heuristics without refetching.
+    Also returns snippet_by_id so we can apply resurfaced-deal heuristics without refetching.
     """
     reps = reps[:max_items]
     extract_input = []
@@ -201,7 +219,6 @@ def build_structured(
         txt = extract_article_text(r["url"]) or ""
         snippet = txt.strip().replace("\n", " ")
         snippet = snippet[:snippet_chars]
-
         snippet_by_id[r["id"]] = snippet
 
         extract_input.append(
@@ -231,6 +248,12 @@ def build_digest_text() -> str:
     if not raw_items:
         return "*Daily Biotech Digest* — (no items found in last ~24h)"
 
+    # Blocklist filter (pre-AI)
+    raw_items = [it for it in raw_items if host_from_url(it.get("link", "")) not in BLOCKED_DOMAINS]
+
+    if not raw_items:
+        return "*Daily Biotech Digest* — (items found, but all were filtered by blocklist)"
+
     # A) Deduplicate via AI clustering
     reps, rep_to_others = build_clusters(raw_items)
 
@@ -250,7 +273,7 @@ def build_digest_text() -> str:
     ]
     buckets = {k: [] for k in bucket_order}
 
-    # We'll store deal-recap items separately
+    # Deal recaps separately
     resurfaced_deals: list[dict] = []
 
     # Score for Top 3
@@ -259,7 +282,7 @@ def build_digest_text() -> str:
         s = structured_by_id.get(r["id"], {})
         cat = s.get("category", "Other")
 
-        # --- NEW: Stale/recap filter for M&A/Licensing ---
+        # Keep recap/analysis deals out of "new M&A"
         if cat == "M&A/Licensing":
             snip = snippet_by_id.get(r["id"], "")
             if is_resurfaced_deal(snip):
@@ -309,7 +332,7 @@ def build_digest_text() -> str:
                     except Exception:
                         pass
                 if alt_urls:
-                    lines.append("  ↳ Also covered by: " + " / ".join([slack_plain(u) for u in alt_urls]))
+                    lines.append("  ↳ Also covered by: " + " / ".join([slack_source_link(u) for u in alt_urls]))
     lines.append("")
 
     # Sections
@@ -364,14 +387,14 @@ def build_digest_text() -> str:
                     except Exception:
                         pass
                 if alt_urls:
-                    lines.append("  ↳ Also covered by: " + " / ".join([slack_plain(u) for u in alt_urls]))
+                    lines.append("  ↳ Also covered by: " + " / ".join([slack_source_link(u) for u in alt_urls]))
 
         lines.append("")
 
-    # NEW: Deal recaps / resurfaced items section
+    # Deal recaps / resurfaced items section
     if resurfaced_deals:
         lines.append("*📌 Earlier but resurfaced (deal recap / analysis)*")
-        for r in resurfaced_deals[:10]:
+        for r in resurfaced_deals[:12]:
             s = structured_by_id.get(r["id"], {})
             summary = (s.get("one_line_summary") or "").strip()
             takeaway = (s.get("vc_takeaway") or "").strip()
@@ -379,7 +402,6 @@ def build_digest_text() -> str:
             if summary:
                 lines.append(f"  ↳ {summary}")
             if takeaway:
-                # Label it as recap so it doesn't read like "new deal"
                 lines.append(f"  ↳ *VC Takeaway (recap lens):* {takeaway}")
         lines.append("")
 
