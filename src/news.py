@@ -117,19 +117,56 @@ def _get_text(elem: ET.Element, tag_names: list[str]) -> str | None:
 
 def _unwrap_google_news(url: str, timeout_s: int = 10) -> str:
     """
-    Google News RSS links often look like https://news.google.com/rss/articles/...
-    We follow redirects to get the real publisher URL (biospace.com, reuters.com, etc.).
+    Google News RSS often returns links like:
+      https://news.google.com/rss/articles/CBMi...
+    In many environments this does NOT 302 redirect to the publisher.
+    This function:
+      1) tries redirects
+      2) if still on news.google.com, parses HTML to extract the publisher URL
     """
     if "news.google.com" not in (url or ""):
         return url
+
+    headers = {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     try:
-        r = requests.get(
-            url,
-            headers={"User-Agent": UA, "Accept": "text/html,*/*"},
-            timeout=timeout_s,
-            allow_redirects=True,
-        )
-        return r.url or url
+        r = requests.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
+
+        # If we actually ended up on a non-Google domain, great.
+        final = (r.url or "").strip()
+        if final and "news.google.com" not in final:
+            return final
+
+        html_text = r.text or ""
+
+        # Common pattern: ...&url=https%3A%2F%2Fwww.biospace.com%2F...
+        m = re.search(r"[?&]url=(https%3A%2F%2F[^&\"'>]+)", html_text)
+        if m:
+            try:
+                from urllib.parse import unquote
+                real = unquote(m.group(1))
+                if real.startswith("https://") and "news.google.com" not in real:
+                    return real
+            except Exception:
+                pass
+
+        # Fallback: find the first external https:// link that isn't Google
+        m2 = re.search(r'href="(https://[^"]+)"', html_text)
+        if m2:
+            candidate = m2.group(1)
+            if "news.google.com" not in candidate and "google.com" not in candidate:
+                return candidate
+
+        # Another fallback: any https://... in page text
+        m3 = re.search(r"(https://(?!news\.google\.com|www\.google\.com)[^\s\"'<>]+)", html_text)
+        if m3:
+            return m3.group(1)
+
+        return url
     except Exception:
         return url
 
