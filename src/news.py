@@ -2,8 +2,9 @@
 import re
 import feedparser
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
+from urllib.parse import urlparse, parse_qs, unquote
 
-# Broad coverage with “last 24h” via Google News RSS queries
 RSS = [
     "https://news.google.com/rss/search?q=biotech+when:1d&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=pharma+when:1d&hl=en-US&gl=US&ceid=US:en",
@@ -18,7 +19,6 @@ RSS = [
     "https://news.google.com/rss/search?q=European+biotech+when:1d&hl=en-US&gl=US&ceid=US:en",
 ]
 
-# Categorization regexes
 IPO_RE = re.compile(r"\b(IPO|S-1|S-1/A|F-1|F-1/A|424B4|priced its IPO|prices IPO|sets terms)\b", re.IGNORECASE)
 DEAL_RE = re.compile(r"\b(acquire|acquisition|merger|M&A|buyout|tender offer|license|licensing|partner|partnership|collaboration|deal)\b", re.IGNORECASE)
 FIN_RE  = re.compile(r"\b(Series\s+[A-Z]|financing|raises|raised|funding|private placement|public offering|follow-on|PIPE)\b", re.IGNORECASE)
@@ -28,14 +28,37 @@ REG_RE  = re.compile(r"\b(FDA|EMA|CHMP|approval|CRL|PDUFA|BLA|NDA|MAA|complete r
 NORDIC_EU_RE = re.compile(r"\b(Nordic|Sweden|Norway|Denmark|Finland|Iceland|European|Europe|EU|EMA)\b", re.IGNORECASE)
 PHARMA_RE = re.compile(r"\b(Novartis|Roche|Pfizer|AstraZeneca|GSK|Sanofi|Merck|BMS|J&J|Johnson\s*&\s*Johnson|AbbVie|Lilly|Novo|Takeda|Bayer)\b", re.IGNORECASE)
 
-# Money detection for “materiality”
 MONEY_RE = re.compile(r"\$\s?([0-9]+(?:\.[0-9]+)?)\s?(B|bn|billion|M|m|million)?", re.IGNORECASE)
 
+def _canonicalize_url(url: str) -> str:
+    """
+    Try to unwrap Google News URLs to their underlying article URL when present.
+    """
+    try:
+        p = urlparse(url)
+        qs = parse_qs(p.query)
+        if "url" in qs and qs["url"]:
+            return unquote(qs["url"][0])
+        return url
+    except Exception:
+        return url
+
+def _normalize_title(title: str) -> str:
+    """
+    Remove source suffixes and normalize punctuation/spaces.
+    """
+    t = (title or "").strip()
+    # Remove " - Outlet" suffix (Google News often appends publisher)
+    t = re.split(r"\s+-\s+", t, maxsplit=1)[0].strip()
+    t = t.lower()
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def _is_near_duplicate(a: str, b: str, threshold: float = 0.92) -> bool:
+    return SequenceMatcher(None, a, b).ratio() >= threshold
+
 def fetch_last_24h(limit_per_feed: int = 40) -> list[dict]:
-    """
-    Pull items from RSS feeds and best-effort filter to last 24 hours if timestamps are available.
-    Returns list of {title, link}.
-    """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=24)
 
@@ -55,24 +78,37 @@ def fetch_last_24h(limit_per_feed: int = 40) -> list[dict]:
                 if dt < cutoff:
                     continue
 
-            items.append({"title": title, "link": link})
+            items.append({
+                "title": title,
+                "link": _canonicalize_url(link),
+                "norm_title": _normalize_title(title),
+            })
 
-    # De-duplicate
-    seen = set()
-    out = []
+    # First pass: exact de-dupe (same normalized title OR same canonical URL)
+    seen_title = set()
+    seen_url = set()
+    dedup1 = []
     for it in items:
-        key = (it["title"], it["link"])
-        if key in seen:
+        if it["norm_title"] in seen_title:
             continue
-        seen.add(key)
-        out.append(it)
+        if it["link"] in seen_url:
+            continue
+        seen_title.add(it["norm_title"])
+        seen_url.add(it["link"])
+        dedup1.append(it)
 
+    # Second pass: fuzzy de-dupe (near-identical titles)
+    dedup2: list[dict] = []
+    for it in dedup1:
+        if any(_is_near_duplicate(it["norm_title"], j["norm_title"]) for j in dedup2):
+            continue
+        dedup2.append(it)
+
+    # Strip helper field before returning
+    out = [{"title": it["title"], "link": it["link"]} for it in dedup2]
     return out
 
 def categorize(items: list[dict], max_per_category: int = 6) -> dict[str, list[dict]]:
-    """
-    Categorize items into digest sections.
-    """
     cats: dict[str, list[dict]] = {
         "💰 Financings": [],
         "🚀 IPOs / Public markets": [],
@@ -86,7 +122,6 @@ def categorize(items: list[dict], max_per_category: int = 6) -> dict[str, list[d
 
     for it in items:
         t = it["title"]
-
         if IPO_RE.search(t):
             cats["🚀 IPOs / Public markets"].append(it)
         elif DEAL_RE.search(t):
@@ -104,38 +139,24 @@ def categorize(items: list[dict], max_per_category: int = 6) -> dict[str, list[d
         else:
             cats["🗞️ Other notable biotech"].append(it)
 
-    # Keep Slack concise
     for k in list(cats.keys()):
         cats[k] = cats[k][:max_per_category]
-
     return cats
 
 def _money_to_usd_millions(title: str) -> float:
-    """
-    Roughly parse the largest $ amount in the title and convert to millions.
-    """
     vals = []
-    for m in MONEY_RE.finditer(title):
+    for m in MONEY_RE.finditer(title or ""):
         num = float(m.group(1))
         unit = (m.group(2) or "").lower()
         if unit in ("b", "bn", "billion"):
             vals.append(num * 1000.0)
         elif unit in ("m", "million"):
             vals.append(num)
-        else:
-            # ambiguous if no unit; ignore to reduce false positives
-            continue
     return max(vals) if vals else 0.0
 
 def materiality_score(title: str, category: str) -> int:
-    """
-    Simple heuristic scoring so we can pick “Top 3”.
-    Higher = more material.
-    """
-    t = title.lower()
+    t = (title or "").lower()
     score = 0
-
-    # Category base weights
     if category.startswith("🤝"):
         score += 35
     elif category.startswith("🏛️"):
@@ -153,7 +174,6 @@ def materiality_score(title: str, category: str) -> int:
     else:
         score += 5
 
-    # Big signal keywords
     if "acquire" in t or "acquisition" in t or "merger" in t:
         score += 20
     if "license" in t or "licensing" in t or "collaboration" in t or "partnership" in t:
@@ -171,7 +191,6 @@ def materiality_score(title: str, category: str) -> int:
     if "ipo" in t and ("priced" in t or "prices" in t):
         score += 10
 
-    # Money boosts
     mm = _money_to_usd_millions(title)
     if mm >= 1000:
         score += 25
