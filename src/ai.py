@@ -320,3 +320,22 @@ Filing text:
 
     txt = _groq_chat([system, user], max_tokens=700, temperature=0.1)
     return _parse_json_strict(txt, repair=True)
+
+
+def ai_filter_stale_deals(items: list[dict]) -> dict:
+    """
+    Input: [{id, title, snippet}]
+    Output: { keep_ids:[int], stale_ids:[int] }
+    """
+    system = {"role": "system", "content": "Return valid JSON only. No markdown."}
+    user = {
+        "role": "user",
+        "content": (
+            "For each item, decide if it is a NEWLY ANNOUNCED deal in the last ~24h "
+            "vs an older deal being discussed/recapped.\n"
+            "Return JSON: {keep_ids:[...], stale_ids:[...]}.\n\n"
+            + "\n\n".join([f"ID:{it['id']}\nTITLE:{it['title']}\nSNIPPET:{it.get('snippet','')[:1200]}" for it in items])
+        ),
+    }
+    txt = _groq_chat([system, user], max_tokens=900, temperature=0.0)
+    return _parse_json_strict(txt, repair=True)
