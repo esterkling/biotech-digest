@@ -121,35 +121,27 @@ def _get_text(elem: ET.Element, tag_names: list[str]) -> str | None:
     return None
 
 
-def _parse_rss_or_atom(xml_bytes: bytes) -> list[dict]:
-    """
-    Parses RSS2 / Atom feeds.
-    Returns list of {title, link, published_dt}
-    """
-    root = ET.fromstring(xml_bytes)
+if root_tag.lower() == "rss":
+    # Namespace-safe search
+    channel = root.find(".//{*}channel")
+    if channel is None:
+        return []
 
-    # Figure out if RSS or Atom
-    root_tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+    for item in channel.findall(".//{*}item"):
+        title = _get_text(item, ["title"]) or ""
+        link = _get_text(item, ["link"]) or ""
+        pub = _get_text(item, ["pubDate", "date", "published", "updated"])
+        published_dt = _parse_dt(pub)
 
-    items: list[dict] = []
+        title = _clean_text(title)
+        link = _clean_text(link)
 
-    if root_tag.lower() == "rss":
-        # Namespace-safe search
-        channel = root.find(".//{*}channel")
-        if channel is None:
-            return []
+        # ✅ ADD THIS (unwrap Google News wrapper links)
+        link = _unwrap_google_news(link)
 
-        for item in channel.findall(".//{*}item"):
-            title = _get_text(item, ["title"]) or ""
-            link = _get_text(item, ["link"]) or ""
-            pub = _get_text(item, ["pubDate", "date", "published", "updated"])
-            published_dt = _parse_dt(pub)
-
-            title = _clean_text(title)
-            link = _clean_text(link)
-
-            if title and link:
-                items.append({"title": title, "link": link, "published_dt": published_dt})
+        if title and link:
+            items.append({"title": title, "link": link, "published_dt": published_dt})
+            
     else:
         # Atom usually: <feed><entry>...
         # entries may have <link href="..."/>
@@ -221,6 +213,15 @@ def _dedupe(items: list[dict]) -> list[dict]:
         seen.add(key)
         out.append(it)
     return out
+
+def _unwrap_google_news(url: str, timeout_s: int = 10) -> str:
+    if "news.google.com" not in (url or ""):
+        return url
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=timeout_s, allow_redirects=True)
+        return r.url or url  # final redirected URL (often biospace.com, reuters.com, etc.)
+    except Exception:
+        return url
 
 
 # ----------------------------
