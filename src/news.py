@@ -58,9 +58,35 @@ def _normalize_title(title: str) -> str:
 def _is_near_duplicate(a: str, b: str, threshold: float = 0.92) -> bool:
     return SequenceMatcher(None, a, b).ratio() >= threshold
 
+from datetime import datetime, timezone, timedelta
+
 def fetch_last_24h(limit_per_feed: int = 40) -> list[dict]:
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=24)
+
+    all_items = []
+
+    for feed_url in FEEDS:
+        # fetch RSS
+        items = fetch_feed(feed_url, limit=limit_per_feed)
+        all_items.extend(items)
+
+    print("Total collected:", len(all_items))  # <-- OK here
+
+    recent_items = []
+
+    for item in all_items:
+        published_dt = item.get("published")
+
+        # ✅ IMPORTANT FIX
+        if published_dt is not None and published_dt < cutoff:
+            continue
+
+        recent_items.append(item)
+
+    print("After 24h filter:", len(recent_items))  # <-- OK here
+
+    return recent_items
 
     items: list[dict] = []
     for url in RSS:
