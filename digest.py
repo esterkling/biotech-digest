@@ -3,15 +3,14 @@ import os
 from datetime import datetime
 from dateutil import tz
 
-from src.news import fetch_last_24h, categorize
+from src.news import fetch_last_24h, categorize, materiality_score
 from src.slack import post
 from src.edgar import edgar_private_price_analysis, guess_ticker_from_text
 
 
 def should_run_now_stockholm() -> bool:
     """
-    If your workflow runs twice (06:00 and 07:00 UTC), this ensures you post only once
-    at 08:00 Europe/Stockholm local time (handles DST cleanly).
+    Your workflow runs twice/day; this ensures you post only once at 08:00 Stockholm time (DST-safe).
     """
     now = datetime.now(tz=tz.gettz("Europe/Stockholm"))
     return now.hour == 8
@@ -20,7 +19,6 @@ def should_run_now_stockholm() -> bool:
 def slack_link(url: str, title: str) -> str:
     """
     Slack "pretty link" format: <url|text>
-    Keeps messages compact and avoids long raw URLs.
     """
     title = (title or "").replace("\n", " ").strip()
     if len(title) > 95:
@@ -28,37 +26,82 @@ def slack_link(url: str, title: str) -> str:
     return f"<{url}|{title}>"
 
 
-def vc_takeaway_stub(category: str) -> str:
+def item_takeaway(category: str, title: str) -> str:
     """
-    Minimal, safe placeholder takeaway per category.
-    (You can later replace with a more sophisticated summarizer.)
+    One-sentence VC takeaway per item (heuristic).
     """
-    mapping = {
-        "💰 Financings": "VC takeaway: Watch pricing + syndicate quality; financings signal where conviction is returning.",
-        "🚀 IPOs / Public markets": "VC takeaway: Compare IPO terms vs last private round to gauge step-up/down and liquidity conditions.",
-        "🤝 M&A and licensing": "VC takeaway: Deal flow reveals pharma priorities; milestones/structure often matter more than headline value.",
-        "🧪 Clinical readouts / safety": "VC takeaway: Readouts reprice quickly—focus on durability, safety, and competitive differentiation.",
-        "🏛️ FDA / EMA regulatory": "VC takeaway: Regulatory decisions compress timelines; track labels, post-mkt commitments, and next filings.",
-        "💊 Pharma / big biotech": "VC takeaway: Macro moves in big pharma shape partnering and exit appetite for venture-backed assets.",
-        "🌍 Nordic / European biotech": "VC takeaway: Regional signal is often early—financings/partnerships can prefigure global attention.",
-        "🗞️ Other notable biotech": "VC takeaway: Use quieter headlines to spot emerging themes and second-order effects.",
-    }
-    return mapping.get(category, "VC takeaway: Track the implications for valuation, BD appetite, and upcoming catalysts.")
+    t = title.lower()
+
+    if category.startswith("🤝"):
+        if "acquir" in t or "merger" in t:
+            return "VC takeaway: M&A confirms strategic demand—map likely next targets with near-term catalysts."
+        return "VC takeaway: Deal structure (upfront vs milestones) is the real signal of conviction—watch who takes development risk."
+    if category.startswith("💰"):
+        return "VC takeaway: Financing terms reveal risk appetite—track valuation resets, insider participation, and runway extension."
+    if category.startswith("🚀"):
+        return "VC takeaway: IPO strength is best judged vs last private price/share and aftermarket—this sets the next crossover bar."
+    if category.startswith("🧪"):
+        if "phase 3" in t:
+            return "VC takeaway: Late-stage clinical data can unlock BD quickly—watch durability, safety, and subgroup consistency."
+        if "hold" in t or "safety" in t:
+            return "VC takeaway: Safety signals reprice companies fast—expect capital structure stress and partnering renegotiations."
+        return "VC takeaway: Readouts are about differentiation vs SOC—endpoint selection and effect size drive valuation, not headlines."
+    if category.startswith("🏛️"):
+        if "approved" in t or "approval" in t:
+            return "VC takeaway: Approval de-risks revenue but shifts focus to launch execution, label, and payer dynamics."
+        if "crl" in t or "complete response" in t:
+            return "VC takeaway: CRLs often become financing events—watch CMC timelines and whether partners step in or step back."
+        return "VC takeaway: Regulatory moves compress timelines—track label details and post-marketing requirements."
+    if category.startswith("🌍"):
+        return "VC takeaway: Europe/Nordics can be early signal—regional wins often precede global partnering and pricing momentum."
+    if category.startswith("💊"):
+        return "VC takeaway: Big pharma portfolio moves set partnering demand—follow therapeutic area strategy shifts."
+    return "VC takeaway: Track second-order effects on valuation comps, partner behavior, and upcoming catalysts."
+
+
+def build_top3(cats: dict[str, list[dict]]) -> list[dict]:
+    """
+    Build a “Top 3 most material” list across all categories using heuristic scoring.
+    """
+    flat = []
+    for cat, bucket in cats.items():
+        for it in bucket:
+            flat.append({
+                "category": cat,
+                "title": it["title"],
+                "link": it["link"],
+                "score": materiality_score(it["title"], cat)
+            })
+    flat.sort(key=lambda x: x["score"], reverse=True)
+    return flat[:3]
 
 
 def build_digest_text() -> str:
     ua = os.environ["SEC_USER_AGENT"]
+
     items = fetch_last_24h()
     cats = categorize(items)
+    top3 = build_top3(cats)
 
     now_local = datetime.now(tz=tz.gettz("Europe/Stockholm"))
     lines: list[str] = []
     lines.append(f"*Daily Biotech Digest* — {now_local.strftime('%Y-%m-%d')} (last ~24h)")
     lines.append("")
 
+    # --- Top 3 ---
+    lines.append("*🔥 Top 3 most material items*")
+    if not top3:
+        lines.append("• (No major items surfaced in this feed window.)")
+    else:
+        for x in top3:
+            lines.append(f"• [{x['category']}] {slack_link(x['link'], x['title'])}")
+            lines.append(f"  ↳ {item_takeaway(x['category'], x['title'])}")
+    lines.append("")
+
     # --- IPO section first, with EDGAR enrichment ---
     ipo_cat = "🚀 IPOs / Public markets"
     ipo_items = cats.get(ipo_cat, [])
+
     lines.append(f"*{ipo_cat}*")
     if not ipo_items:
         lines.append("• None detected in the last 24 hours.")
@@ -66,8 +109,9 @@ def build_digest_text() -> str:
         for it in ipo_items:
             title, link = it["title"], it["link"]
             lines.append(f"• {slack_link(link, title)}")
+            lines.append(f"  ↳ {item_takeaway(ipo_cat, title)}")
 
-            # Improved ticker guessing (no longer depends on (TICKER) in headline)
+            # Improved ticker guessing
             ticker = guess_ticker_from_text(title, ua)
             if not ticker:
                 lines.append("  ↳ EDGAR: could not infer ticker from headline.")
@@ -84,14 +128,10 @@ def build_digest_text() -> str:
                 lines.append(f"  ↳ EDGAR ({ticker}): last private price/share (best-effort) *${p}* (conf {conf:.2f})")
                 if filing and fdate and furl:
                     lines.append(f"  ↳ Source: {filing} filed {fdate} — {slack_link(furl, 'SEC filing')}")
-                # If you later parse IPO range/final from news, pass ipo_low/high/final into edgar_private_price_analysis()
-                # and then print analysis['step_up_down_pct'] here.
             else:
                 lines.append(f"  ↳ EDGAR ({ticker}): could not reliably extract last private price/share (conf {conf:.2f}).")
                 if furl:
                     lines.append(f"  ↳ Filing: {slack_link(furl, 'SEC filing')}")
-
-    lines.append(f"_{vc_takeaway_stub(ipo_cat)}_")
     lines.append("")
 
     # --- Other categories ---
@@ -112,15 +152,15 @@ def build_digest_text() -> str:
             lines.append("• (No major items surfaced in this feed window.)")
         else:
             for it in bucket:
-                lines.append(f"• {slack_link(it['link'], it['title'])}")
-        lines.append(f"_{vc_takeaway_stub(cat)}_")
+                title, link = it["title"], it["link"]
+                lines.append(f"• {slack_link(link, title)}")
+                lines.append(f"  ↳ {item_takeaway(cat, title)}")
         lines.append("")
 
     return "\n".join(lines).strip()
 
 
 def main():
-    # Keep your “only at 08:00 Stockholm” gate.
     # For manual testing, you can comment this out temporarily.
     if not should_run_now_stockholm():
         print("Not 08:00 Stockholm time, exiting.")
