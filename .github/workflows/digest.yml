@@ -31,6 +31,7 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           FORCE_SEND: ${{ github.event.inputs.force_send }}
         run: |
           python digest.py
