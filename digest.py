@@ -6,6 +6,8 @@ from dateutil import tz
 from src.news import fetch_last_24h, categorize, materiality_score
 from src.slack import post
 from src.edgar import edgar_private_price_analysis, guess_ticker_from_text
+from src.ai import ai_summarize_takeaway
+from src.extract import extract_article_text
 
 
 def should_run_now_stockholm() -> bool:
@@ -32,32 +34,20 @@ def item_takeaway(category: str, title: str) -> str:
     """
     t = title.lower()
 
-    if category.startswith("🤝"):
-        if "acquir" in t or "merger" in t:
-            return "VC takeaway: M&A confirms strategic demand—map likely next targets with near-term catalysts."
-        return "VC takeaway: Deal structure (upfront vs milestones) is the real signal of conviction—watch who takes development risk."
-    if category.startswith("💰"):
-        return "VC takeaway: Financing terms reveal risk appetite—track valuation resets, insider participation, and runway extension."
-    if category.startswith("🚀"):
-        return "VC takeaway: IPO strength is best judged vs last private price/share and aftermarket—this sets the next crossover bar."
-    if category.startswith("🧪"):
-        if "phase 3" in t:
-            return "VC takeaway: Late-stage clinical data can unlock BD quickly—watch durability, safety, and subgroup consistency."
-        if "hold" in t or "safety" in t:
-            return "VC takeaway: Safety signals reprice companies fast—expect capital structure stress and partnering renegotiations."
-        return "VC takeaway: Readouts are about differentiation vs SOC—endpoint selection and effect size drive valuation, not headlines."
-    if category.startswith("🏛️"):
-        if "approved" in t or "approval" in t:
-            return "VC takeaway: Approval de-risks revenue but shifts focus to launch execution, label, and payer dynamics."
-        if "crl" in t or "complete response" in t:
-            return "VC takeaway: CRLs often become financing events—watch CMC timelines and whether partners step in or step back."
-        return "VC takeaway: Regulatory moves compress timelines—track label details and post-marketing requirements."
-    if category.startswith("🌍"):
-        return "VC takeaway: Europe/Nordics can be early signal—regional wins often precede global partnering and pricing momentum."
-    if category.startswith("💊"):
-        return "VC takeaway: Big pharma portfolio moves set partnering demand—follow therapeutic area strategy shifts."
-    return "VC takeaway: Track second-order effects on valuation comps, partner behavior, and upcoming catalysts."
+    article_text = extract_article_text(link)
 
+try:
+    ai_data = ai_summarize_takeaway(title, link, cat, article_text)
+
+    summary = ai_data.get("summary", "")
+    takeaway = ai_data.get("vc_takeaway", "")
+    materiality = ai_data.get("materiality", "medium")
+
+    lines.append(f"  ↳ {summary}")
+    lines.append(f"  ↳ *VC Takeaway:* {takeaway} ({materiality})")
+
+except Exception as e:
+    lines.append("  ↳ AI summary unavailable.")
 
 def build_top3(cats: dict[str, list[dict]]) -> list[dict]:
     """
