@@ -8,6 +8,7 @@ from src.slack import post
 from src.edgar import edgar_private_price_analysis, guess_ticker_from_text
 from src.ai import ai_summarize_takeaway
 from src.extract import extract_article_text
+from src.ai import ai_cluster_headlines, ai_extract_structured
 
 
 def should_run_now_stockholm() -> bool:
