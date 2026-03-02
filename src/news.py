@@ -6,19 +6,33 @@ import re
 import html
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 import xml.etree.ElementTree as ET
 
 import requests
 
 
 # ----------------------------
-# Feed list (FREE sources)
+# Configuration
+# ----------------------------
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
+DEBUG = os.environ.get("DEBUG_NEWS", "").lower() in ("1", "true", "yes", "y")
+
+# Only unwrap a limited number of Google News links to avoid hundreds of extra requests
+GOOGLE_UNWRAP_CAP = int(os.environ.get("GOOGLE_UNWRAP_CAP", "20"))
+
+
+# ----------------------------
+# Feeds (free sources)
 # ----------------------------
 BASE_FEEDS = [
     "https://www.fiercebiotech.com/rss/xml",
     "https://www.biopharmadive.com/feeds/news/",
-    # If these work for you, keep them. They often block GitHub runners.
+    # These often block GitHub runners; keep commented unless proven working:
     # "https://www.globenewswire.com/RssFeed/subjectcode/HEA",
     # "https://www.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRX0I=",
 ]
@@ -52,21 +66,16 @@ FEEDS = BASE_FEEDS + [_google_news_rss_url(q) for q in GOOGLE_NEWS_QUERIES]
 
 
 # ----------------------------
-# Helpers
+# Logging
 # ----------------------------
-UA = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-)
-
-DEBUG = os.environ.get("DEBUG_NEWS", "").lower() in ("1", "true", "yes", "y")
-
-
 def _debug(*args):
     if DEBUG:
         print("[news]", *args)
 
 
+# ----------------------------
+# Parsing helpers
+# ----------------------------
 def _clean_text(s: str) -> str:
     s = html.unescape(s or "")
     s = re.sub(r"\s+", " ", s).strip()
@@ -82,7 +91,7 @@ def _parse_dt(dt_str: str | None) -> datetime | None:
         return None
     dt_str = dt_str.strip()
 
-    # RFC 2822 (RSS pubDate)
+    # RFC 2822
     try:
         dt = parsedate_to_datetime(dt_str)
         if dt.tzinfo is None:
@@ -91,7 +100,7 @@ def _parse_dt(dt_str: str | None) -> datetime | None:
     except Exception:
         pass
 
-    # ISO 8601 (Atom updated/published)
+    # ISO 8601
     try:
         s = dt_str.replace("Z", "+00:00")
         dt = datetime.fromisoformat(s)
@@ -104,8 +113,7 @@ def _parse_dt(dt_str: str | None) -> datetime | None:
 
 def _get_text(elem: ET.Element, tag_names: list[str]) -> str | None:
     """
-    Get text for first matching tag name in elem (direct child search).
-    Handles namespaces by matching tag suffix.
+    Get text for first matching child tag name (namespace-safe by suffix).
     """
     for child in list(elem):
         suffix = child.tag.split("}")[-1] if "}" in child.tag else child.tag
@@ -115,66 +123,11 @@ def _get_text(elem: ET.Element, tag_names: list[str]) -> str | None:
     return None
 
 
-def _unwrap_google_news(url: str, timeout_s: int = 10) -> str:
-    """
-    Google News RSS often returns links like:
-      https://news.google.com/rss/articles/CBMi...
-    In many environments this does NOT 302 redirect to the publisher.
-    This function:
-      1) tries redirects
-      2) if still on news.google.com, parses HTML to extract the publisher URL
-    """
-    if "news.google.com" not in (url or ""):
-        return url
-
-    headers = {
-        "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    try:
-        r = requests.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
-
-        # If we actually ended up on a non-Google domain, great.
-        final = (r.url or "").strip()
-        if final and "news.google.com" not in final:
-            return final
-
-        html_text = r.text or ""
-
-        # Common pattern: ...&url=https%3A%2F%2Fwww.biospace.com%2F...
-        m = re.search(r"[?&]url=(https%3A%2F%2F[^&\"'>]+)", html_text)
-        if m:
-            try:
-                from urllib.parse import unquote
-                real = unquote(m.group(1))
-                if real.startswith("https://") and "news.google.com" not in real:
-                    return real
-            except Exception:
-                pass
-
-        # Fallback: find the first external https:// link that isn't Google
-        m2 = re.search(r'href="(https://[^"]+)"', html_text)
-        if m2:
-            candidate = m2.group(1)
-            if "news.google.com" not in candidate and "google.com" not in candidate:
-                return candidate
-
-        # Another fallback: any https://... in page text
-        m3 = re.search(r"(https://(?!news\.google\.com|www\.google\.com)[^\s\"'<>]+)", html_text)
-        if m3:
-            return m3.group(1)
-
-        return url
-    except Exception:
-        return url
-
-
 def _parse_rss_or_atom(xml_bytes: bytes) -> list[dict]:
     """
     Parses RSS2 / Atom feeds.
     Returns list of {title, link, published_dt}
+    IMPORTANT: does NOT unwrap Google links here (too slow). That is done later lazily.
     """
     root = ET.fromstring(xml_bytes)
     root_tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
@@ -195,10 +148,6 @@ def _parse_rss_or_atom(xml_bytes: bytes) -> list[dict]:
 
             title = _clean_text(title)
             link = _clean_text(link)
-
-            # ✅ unwrap Google News wrapper links
-            if "news.google.com" in link:
-                link = _unwrap_google_news(link)
 
             if title and link:
                 items.append({"title": title, "link": link, "published_dt": published_dt})
@@ -224,9 +173,6 @@ def _parse_rss_or_atom(xml_bytes: bytes) -> list[dict]:
         title = _clean_text(title)
         link = _clean_text(link)
 
-        if "news.google.com" in link:
-            link = _unwrap_google_news(link)
-
         if title and link:
             items.append({"title": title, "link": link, "published_dt": published_dt})
 
@@ -243,7 +189,6 @@ def _fetch_feed(url: str, timeout_s: int = 25) -> list[dict]:
         r = requests.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
         ct = (r.headers.get("Content-Type") or "").lower()
         _debug("GET", url, "->", r.status_code, ct)
-
         r.raise_for_status()
 
         items = _parse_rss_or_atom(r.content)
@@ -271,20 +216,90 @@ def _dedupe(items: list[dict]) -> list[dict]:
 
 
 # ----------------------------
+# Google News unwrapping (LAZY)
+# ----------------------------
+def _unwrap_google_news(url: str, timeout_s: int = 10) -> str:
+    """
+    Try to turn a Google News wrapper URL into the publisher URL.
+    We keep it best-effort and fast.
+    """
+    if "news.google.com" not in (url or ""):
+        return url
+
+    headers = {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
+
+        # If redirects got us off Google, done
+        final = (r.url or "").strip()
+        if final and "news.google.com" not in final:
+            return final
+
+        html_text = r.text or ""
+
+        # Pattern: url=https%3A%2F%2Fpublisher...
+        m = re.search(r"[?&]url=(https%3A%2F%2F[^&\"'>]+)", html_text)
+        if m:
+            real = unquote(m.group(1))
+            if real.startswith("https://") and "news.google.com" not in real:
+                return real
+
+        # Fallback: first non-google https:// link in HTML
+        m2 = re.search(r'(https://(?!news\.google\.com|www\.google\.com)[^\s"\'<>]+)', html_text)
+        if m2:
+            return m2.group(1)
+
+        return url
+    except Exception:
+        return url
+
+
+def _unwrap_some_google_links(items: list[dict], max_unwrap: int) -> list[dict]:
+    """
+    Unwrap ONLY the first N Google News links to avoid hundreds of extra requests.
+    """
+    if max_unwrap <= 0:
+        return items
+
+    count = 0
+    for it in items:
+        link = it.get("link") or ""
+        if "news.google.com" in link:
+            it["link"] = _unwrap_google_news(link)
+            count += 1
+            if count >= max_unwrap:
+                break
+
+    _debug(f"Unwrapped {count} Google links (cap={max_unwrap}).")
+    return items
+
+
+# ----------------------------
 # Public API
 # ----------------------------
 def fetch_last_24h(limit_per_feed: int = 40) -> list[dict]:
     """
     Returns list of:
       { "title": str, "link": str, "published_dt": datetime|None }
-    Keeps items even if published_dt couldn't be parsed.
+
+    Date filter:
+      - If published_dt parsed and < cutoff => drop
+      - If no published_dt => keep (avoid losing items due to parsing issues)
+
+    Google unwrapping:
+      - Done lazily on top N items only (cap via GOOGLE_UNWRAP_CAP)
     """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=24)
 
-    all_items: list[dict] = []
-
     _debug("Feeds:", len(FEEDS))
+
+    all_items: list[dict] = []
     for feed_url in FEEDS:
         feed_items = _fetch_feed(feed_url)
         if feed_items:
@@ -296,11 +311,8 @@ def fetch_last_24h(limit_per_feed: int = 40) -> list[dict]:
     recent_items: list[dict] = []
     for it in all_items:
         published_dt = it.get("published_dt")
-
-        # ✅ Only filter if we successfully parsed a date
         if published_dt is not None and published_dt < cutoff:
             continue
-
         recent_items.append(it)
 
     # Newest first; undated items last
@@ -310,4 +322,8 @@ def fetch_last_24h(limit_per_feed: int = 40) -> list[dict]:
     )
 
     _debug("After 24h filter:", len(recent_items))
+
+    # ✅ Lazy unwrap only some Google links to keep runtime stable
+    recent_items = _unwrap_some_google_links(recent_items, GOOGLE_UNWRAP_CAP)
+
     return recent_items
