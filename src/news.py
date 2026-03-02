@@ -1,230 +1,254 @@
 # src/news.py
-import re
-import feedparser
-from datetime import datetime, timedelta, timezone
-from difflib import SequenceMatcher
-from urllib.parse import urlparse, parse_qs, unquote
+from __future__ import annotations
 
-RSS = [
-    "https://news.google.com/rss/search?q=biotech+when:1d&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=pharma+when:1d&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=biotech+IPO+S-1+when:1d&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=FDA+approval+when:1d&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=EMA+CHMP+when:1d&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=biotech+acquires+when:1d&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=licensing+deal+biotech+when:1d&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=clinical+trial+readout+biotech+when:1d&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=Series+A+biotech+raises+when:1d&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=Nordic+biotech+when:1d&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=European+biotech+when:1d&hl=en-US&gl=US&ceid=US:en",
+import os
+import re
+import html
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote_plus
+import xml.etree.ElementTree as ET
+
+import requests
+
+
+# ----------------------------
+# Feed list (FREE sources)
+# ----------------------------
+BASE_FEEDS = [
+    # Trade / industry
+    "https://www.fiercebiotech.com/rss/xml",
+    "https://www.biopharmadive.com/feeds/news/",
+    # Press wires (often catch financings, deals, trial updates)
+    "https://www.globenewswire.com/RssFeed/subjectcode/HEA",
+    "https://www.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRX0I=",  # Healthcare
 ]
 
-IPO_RE = re.compile(r"\b(IPO|S-1|S-1/A|F-1|F-1/A|424B4|priced its IPO|prices IPO|sets terms)\b", re.IGNORECASE)
-DEAL_RE = re.compile(r"\b(acquire|acquisition|merger|M&A|buyout|tender offer|license|licensing|partner|partnership|collaboration|deal)\b", re.IGNORECASE)
-FIN_RE  = re.compile(r"\b(Series\s+[A-Z]|financing|raises|raised|funding|private placement|public offering|follow-on|PIPE)\b", re.IGNORECASE)
-CLIN_RE = re.compile(r"\b(Phase\s+[123]|topline|readout|met endpoint|trial results|interim data|clinical hold|SAE|safety)\b", re.IGNORECASE)
-REG_RE  = re.compile(r"\b(FDA|EMA|CHMP|approval|CRL|PDUFA|BLA|NDA|MAA|complete response|clinical hold)\b", re.IGNORECASE)
+GOOGLE_NEWS_QUERIES = [
+    # Big-ticket items you said you don't want to miss
+    "biotech acquisition deal",
+    "biotech licensing deal upfront",
+    "biotech partnership deal",
+    "pharma acquisition deal",
+    "FDA approval biotech",
+    "EMA CHMP positive opinion biotech",
+    "clinical trial readout Phase 2",
+    "clinical trial readout Phase 3",
+    "biotech safety hold FDA",
+    "biotech financing Series A",
+    "biotech financing Series B",
+    "biotech IPO filing S-1",
+    # Europe/Nordics
+    "Nordic biotech financing",
+    "Sweden biotech",
+    "Denmark biotech",
+    "Norway biotech",
+    "Finland biotech",
+    "European biotech licensing deal",
+]
 
-NORDIC_EU_RE = re.compile(r"\b(Nordic|Sweden|Norway|Denmark|Finland|Iceland|European|Europe|EU|EMA)\b", re.IGNORECASE)
-PHARMA_RE = re.compile(r"\b(Novartis|Roche|Pfizer|AstraZeneca|GSK|Sanofi|Merck|BMS|J&J|Johnson\s*&\s*Johnson|AbbVie|Lilly|Novo|Takeda|Bayer)\b", re.IGNORECASE)
+def _google_news_rss_url(query: str) -> str:
+    # when:1d attempts to limit to last day, but we also apply our own cutoff logic
+    q = quote_plus(f"{query} when:1d")
+    return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
-MONEY_RE = re.compile(r"\$\s?([0-9]+(?:\.[0-9]+)?)\s?(B|bn|billion|M|m|million)?", re.IGNORECASE)
+FEEDS = BASE_FEEDS + [_google_news_rss_url(q) for q in GOOGLE_NEWS_QUERIES]
 
-def _canonicalize_url(url: str) -> str:
+
+# ----------------------------
+# Helpers
+# ----------------------------
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
+DEBUG = os.environ.get("DEBUG_NEWS", "").lower() in ("1", "true", "yes", "y")
+
+
+def _debug(*args):
+    if DEBUG:
+        print("[news]", *args)
+
+
+def _clean_text(s: str) -> str:
+    s = html.unescape(s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _parse_dt(dt_str: str | None) -> datetime | None:
     """
-    Try to unwrap Google News URLs to their underlying article URL when present.
+    Parse common RSS/Atom datetime strings.
+    Returns timezone-aware UTC datetime, or None if parsing fails.
     """
+    if not dt_str:
+        return None
+    dt_str = dt_str.strip()
+
+    # Try RFC 2822 via email.utils
     try:
-        p = urlparse(url)
-        qs = parse_qs(p.query)
-        if "url" in qs and qs["url"]:
-            return unquote(qs["url"][0])
-        return url
+        dt = parsedate_to_datetime(dt_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
-        return url
+        pass
 
-def _normalize_title(title: str) -> str:
+    # Try ISO-ish strings (Atom often uses 2026-03-02T06:12:00Z)
+    try:
+        # normalize Z
+        s = dt_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _get_text(elem: ET.Element, tag_names: list[str]) -> str | None:
     """
-    Remove source suffixes and normalize punctuation/spaces.
+    Get text for first matching tag name in elem (direct child search).
+    Handles namespaces by matching tag suffix.
     """
-    t = (title or "").strip()
-    # Remove " - Outlet" suffix (Google News often appends publisher)
-    t = re.split(r"\s+-\s+", t, maxsplit=1)[0].strip()
-    t = t.lower()
-    t = re.sub(r"[^a-z0-9\s]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    for child in list(elem):
+        t = child.tag
+        suffix = t.split("}")[-1] if "}" in t else t
+        if suffix in tag_names:
+            if child.text:
+                return child.text.strip()
+    return None
 
-def _is_near_duplicate(a: str, b: str, threshold: float = 0.92) -> bool:
-    return SequenceMatcher(None, a, b).ratio() >= threshold
 
-from datetime import datetime, timezone, timedelta
+def _parse_rss_or_atom(xml_bytes: bytes) -> list[dict]:
+    """
+    Parses RSS2 / Atom feeds.
+    Returns list of {title, link, published_dt}
+    """
+    root = ET.fromstring(xml_bytes)
 
+    # Figure out if RSS or Atom
+    root_tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+
+    items: list[dict] = []
+
+    if root_tag.lower() == "rss":
+        channel = root.find("./channel")
+        if channel is None:
+            return []
+
+        for item in channel.findall("./item"):
+            title = _get_text(item, ["title"]) or ""
+            link = _get_text(item, ["link"]) or ""
+            pub = _get_text(item, ["pubDate", "date", "published", "updated"])
+            published_dt = _parse_dt(pub)
+
+            title = _clean_text(title)
+            link = _clean_text(link)
+
+            if title and link:
+                items.append({"title": title, "link": link, "published_dt": published_dt})
+
+    else:
+        # Atom usually: <feed><entry>...
+        # entries may have <link href="..."/>
+        for entry in root.findall(".//{*}entry"):
+            title = _get_text(entry, ["title"]) or ""
+            pub = _get_text(entry, ["published", "updated"])
+            published_dt = _parse_dt(pub)
+
+            link = ""
+            # Atom link is attribute href
+            for child in list(entry):
+                suffix = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if suffix == "link":
+                    href = child.attrib.get("href", "")
+                    rel = child.attrib.get("rel", "")
+                    if href and (rel in ("", "alternate")):
+                        link = href
+                        break
+
+            title = _clean_text(title)
+            link = _clean_text(link)
+
+            if title and link:
+                items.append({"title": title, "link": link, "published_dt": published_dt})
+
+    return items
+
+
+def _fetch_feed(url: str, timeout_s: int = 20) -> list[dict]:
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout_s)
+        r.raise_for_status()
+        return _parse_rss_or_atom(r.content)
+    except Exception as e:
+        _debug("Feed failed:", url, "err:", repr(e))
+        return []
+
+
+def _dedupe(items: list[dict]) -> list[dict]:
+    """
+    Basic dedupe by normalized (title, link).
+    AI clustering later will handle deeper dedupe.
+    """
+    seen = set()
+    out = []
+    for it in items:
+        t = (it.get("title") or "").strip().lower()
+        l = (it.get("link") or "").strip()
+        key = (t, l)
+        if not t or not l:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+
+# ----------------------------
+# Public API
+# ----------------------------
 def fetch_last_24h(limit_per_feed: int = 40) -> list[dict]:
+    """
+    Returns a list of dicts:
+      { "title": str, "link": str, "published_dt": datetime|None }
+    Notes:
+      - If published_dt can't be parsed, the item is kept (important).
+      - We do our own last-24h filter; Google News query includes when:1d but we still filter.
+    """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=24)
 
-    all_items = []
+    all_items: list[dict] = []
 
+    _debug("Feeds:", len(FEEDS))
     for feed_url in FEEDS:
-        # fetch RSS
-        items = fetch_feed(feed_url, limit=limit_per_feed)
-        all_items.extend(items)
+        feed_items = _fetch_feed(feed_url)
+        if feed_items:
+            all_items.extend(feed_items[:limit_per_feed])
 
-    print("Total collected:", len(all_items))  # <-- OK here
+    all_items = _dedupe(all_items)
+    _debug("Total collected:", len(all_items))
 
-    recent_items = []
+    recent_items: list[dict] = []
+    for it in all_items:
+        published_dt = it.get("published_dt")
 
-    for item in all_items:
-        published_dt = item.get("published")
-
-        # ✅ IMPORTANT FIX
+        # ✅ key fix: only filter if we successfully parsed date
         if published_dt is not None and published_dt < cutoff:
             continue
 
-        recent_items.append(item)
+        recent_items.append(it)
 
-    print("After 24h filter:", len(recent_items))  # <-- OK here
+    # Sort newest first; undated items go last
+    recent_items.sort(key=lambda x: x["published_dt"] or datetime(1970, 1, 1, tzinfo=timezone.utc), reverse=True)
 
+    _debug("After 24h filter:", len(recent_items))
     return recent_items
-
-    items: list[dict] = []
-    for url in RSS:
-        d = feedparser.parse(url)
-        for e in d.entries[:limit_per_feed]:
-            title = getattr(e, "title", "").strip()
-            link = getattr(e, "link", "").strip()
-            published = getattr(e, "published_parsed", None)
-
-            if not title or not link:
-                continue
-
-            if published:
-                dt = datetime(*published[:6], tzinfo=timezone.utc)
-                if dt < cutoff:
-                    continue
-
-            items.append({
-                "title": title,
-                "link": _canonicalize_url(link),
-                "norm_title": _normalize_title(title),
-            })
-
-    # First pass: exact de-dupe (same normalized title OR same canonical URL)
-    seen_title = set()
-    seen_url = set()
-    dedup1 = []
-    for it in items:
-        if it["norm_title"] in seen_title:
-            continue
-        if it["link"] in seen_url:
-            continue
-        seen_title.add(it["norm_title"])
-        seen_url.add(it["link"])
-        dedup1.append(it)
-
-    # Second pass: fuzzy de-dupe (near-identical titles)
-    dedup2: list[dict] = []
-    for it in dedup1:
-        if any(_is_near_duplicate(it["norm_title"], j["norm_title"]) for j in dedup2):
-            continue
-        dedup2.append(it)
-
-    # Strip helper field before returning
-    out = [{"title": it["title"], "link": it["link"]} for it in dedup2]
-    return out
-
-def categorize(items: list[dict], max_per_category: int = 6) -> dict[str, list[dict]]:
-    cats: dict[str, list[dict]] = {
-        "💰 Financings": [],
-        "🚀 IPOs / Public markets": [],
-        "🤝 M&A and licensing": [],
-        "🧪 Clinical readouts / safety": [],
-        "🏛️ FDA / EMA regulatory": [],
-        "💊 Pharma / big biotech": [],
-        "🌍 Nordic / European biotech": [],
-        "🗞️ Other notable biotech": [],
-    }
-
-    for it in items:
-        t = it["title"]
-        if IPO_RE.search(t):
-            cats["🚀 IPOs / Public markets"].append(it)
-        elif DEAL_RE.search(t):
-            cats["🤝 M&A and licensing"].append(it)
-        elif FIN_RE.search(t):
-            cats["💰 Financings"].append(it)
-        elif REG_RE.search(t):
-            cats["🏛️ FDA / EMA regulatory"].append(it)
-        elif CLIN_RE.search(t):
-            cats["🧪 Clinical readouts / safety"].append(it)
-        elif NORDIC_EU_RE.search(t):
-            cats["🌍 Nordic / European biotech"].append(it)
-        elif PHARMA_RE.search(t):
-            cats["💊 Pharma / big biotech"].append(it)
-        else:
-            cats["🗞️ Other notable biotech"].append(it)
-
-    for k in list(cats.keys()):
-        cats[k] = cats[k][:max_per_category]
-    return cats
-
-def _money_to_usd_millions(title: str) -> float:
-    vals = []
-    for m in MONEY_RE.finditer(title or ""):
-        num = float(m.group(1))
-        unit = (m.group(2) or "").lower()
-        if unit in ("b", "bn", "billion"):
-            vals.append(num * 1000.0)
-        elif unit in ("m", "million"):
-            vals.append(num)
-    return max(vals) if vals else 0.0
-
-def materiality_score(title: str, category: str) -> int:
-    t = (title or "").lower()
-    score = 0
-    if category.startswith("🤝"):
-        score += 35
-    elif category.startswith("🏛️"):
-        score += 30
-    elif category.startswith("🧪"):
-        score += 25
-    elif category.startswith("🚀"):
-        score += 22
-    elif category.startswith("💰"):
-        score += 18
-    elif category.startswith("💊"):
-        score += 10
-    elif category.startswith("🌍"):
-        score += 8
-    else:
-        score += 5
-
-    if "acquire" in t or "acquisition" in t or "merger" in t:
-        score += 20
-    if "license" in t or "licensing" in t or "collaboration" in t or "partnership" in t:
-        score += 12
-    if "approval" in t or "approved" in t:
-        score += 18
-    if "complete response" in t or "crl" in t:
-        score += 18
-    if "clinical hold" in t:
-        score += 18
-    if "phase 3" in t:
-        score += 12
-    if "topline" in t or "met endpoint" in t or "readout" in t:
-        score += 10
-    if "ipo" in t and ("priced" in t or "prices" in t):
-        score += 10
-
-    mm = _money_to_usd_millions(title)
-    if mm >= 1000:
-        score += 25
-    elif mm >= 500:
-        score += 18
-    elif mm >= 100:
-        score += 12
-    elif mm >= 50:
-        score += 6
-
-    return score
