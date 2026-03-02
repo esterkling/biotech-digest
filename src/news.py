@@ -16,16 +16,14 @@ import requests
 # Feed list (FREE sources)
 # ----------------------------
 BASE_FEEDS = [
-    # Trade / industry
     "https://www.fiercebiotech.com/rss/xml",
     "https://www.biopharmadive.com/feeds/news/",
-    # Press wires (often catch financings, deals, trial updates)
-    "https://www.globenewswire.com/RssFeed/subjectcode/HEA",
-    "https://www.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRX0I=",  # Healthcare
+    # If these work for you, keep them. They often block GitHub runners.
+    # "https://www.globenewswire.com/RssFeed/subjectcode/HEA",
+    # "https://www.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRX0I=",
 ]
 
 GOOGLE_NEWS_QUERIES = [
-    # Big-ticket items you said you don't want to miss
     "biotech acquisition deal",
     "biotech licensing deal upfront",
     "biotech partnership deal",
@@ -38,7 +36,6 @@ GOOGLE_NEWS_QUERIES = [
     "biotech financing Series A",
     "biotech financing Series B",
     "biotech IPO filing S-1",
-    # Europe/Nordics
     "Nordic biotech financing",
     "Sweden biotech",
     "Denmark biotech",
@@ -48,7 +45,6 @@ GOOGLE_NEWS_QUERIES = [
 ]
 
 def _google_news_rss_url(query: str) -> str:
-    # when:1d attempts to limit to last day, but we also apply our own cutoff logic
     q = quote_plus(f"{query} when:1d")
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
@@ -86,7 +82,7 @@ def _parse_dt(dt_str: str | None) -> datetime | None:
         return None
     dt_str = dt_str.strip()
 
-    # Try RFC 2822 via email.utils
+    # RFC 2822 (RSS pubDate)
     try:
         dt = parsedate_to_datetime(dt_str)
         if dt.tzinfo is None:
@@ -95,9 +91,8 @@ def _parse_dt(dt_str: str | None) -> datetime | None:
     except Exception:
         pass
 
-    # Try ISO-ish strings (Atom often uses 2026-03-02T06:12:00Z)
+    # ISO 8601 (Atom updated/published)
     try:
-        # normalize Z
         s = dt_str.replace("Z", "+00:00")
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
@@ -113,64 +108,95 @@ def _get_text(elem: ET.Element, tag_names: list[str]) -> str | None:
     Handles namespaces by matching tag suffix.
     """
     for child in list(elem):
-        t = child.tag
-        suffix = t.split("}")[-1] if "}" in t else t
+        suffix = child.tag.split("}")[-1] if "}" in child.tag else child.tag
         if suffix in tag_names:
             if child.text:
                 return child.text.strip()
     return None
 
 
-if root_tag.lower() == "rss":
-    # Namespace-safe search
-    channel = root.find(".//{*}channel")
-    if channel is None:
-        return []
+def _unwrap_google_news(url: str, timeout_s: int = 10) -> str:
+    """
+    Google News RSS links often look like https://news.google.com/rss/articles/...
+    We follow redirects to get the real publisher URL (biospace.com, reuters.com, etc.).
+    """
+    if "news.google.com" not in (url or ""):
+        return url
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": UA, "Accept": "text/html,*/*"},
+            timeout=timeout_s,
+            allow_redirects=True,
+        )
+        return r.url or url
+    except Exception:
+        return url
 
-    for item in channel.findall(".//{*}item"):
-        title = _get_text(item, ["title"]) or ""
-        link = _get_text(item, ["link"]) or ""
-        pub = _get_text(item, ["pubDate", "date", "published", "updated"])
-        published_dt = _parse_dt(pub)
 
-        title = _clean_text(title)
-        link = _clean_text(link)
+def _parse_rss_or_atom(xml_bytes: bytes) -> list[dict]:
+    """
+    Parses RSS2 / Atom feeds.
+    Returns list of {title, link, published_dt}
+    """
+    root = ET.fromstring(xml_bytes)
+    root_tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
 
-        # ✅ ADD THIS (unwrap Google News wrapper links)
-        link = _unwrap_google_news(link)
+    items: list[dict] = []
 
-        if title and link:
-            items.append({"title": title, "link": link, "published_dt": published_dt})
-            
-    else:
-        # Atom usually: <feed><entry>...
-        # entries may have <link href="..."/>
-        for entry in root.findall(".//{*}entry"):
-            title = _get_text(entry, ["title"]) or ""
-            pub = _get_text(entry, ["published", "updated"])
+    # ---------- RSS ----------
+    if root_tag.lower() == "rss":
+        channel = root.find(".//{*}channel")
+        if channel is None:
+            return []
+
+        for item in channel.findall(".//{*}item"):
+            title = _get_text(item, ["title"]) or ""
+            link = _get_text(item, ["link"]) or ""
+            pub = _get_text(item, ["pubDate", "date", "published", "updated"])
             published_dt = _parse_dt(pub)
-
-            link = ""
-            # Atom link is attribute href
-            for child in list(entry):
-                suffix = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-                if suffix == "link":
-                    href = child.attrib.get("href", "")
-                    rel = child.attrib.get("rel", "")
-                    if href and (rel in ("", "alternate")):
-                        link = href
-                        break
 
             title = _clean_text(title)
             link = _clean_text(link)
 
+            # ✅ unwrap Google News wrapper links
+            if "news.google.com" in link:
+                link = _unwrap_google_news(link)
+
             if title and link:
                 items.append({"title": title, "link": link, "published_dt": published_dt})
+
+        return items
+
+    # ---------- Atom ----------
+    for entry in root.findall(".//{*}entry"):
+        title = _get_text(entry, ["title"]) or ""
+        pub = _get_text(entry, ["published", "updated"])
+        published_dt = _parse_dt(pub)
+
+        link = ""
+        for child in list(entry):
+            suffix = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if suffix == "link":
+                href = child.attrib.get("href", "")
+                rel = child.attrib.get("rel", "")
+                if href and (rel in ("", "alternate")):
+                    link = href
+                    break
+
+        title = _clean_text(title)
+        link = _clean_text(link)
+
+        if "news.google.com" in link:
+            link = _unwrap_google_news(link)
+
+        if title and link:
+            items.append({"title": title, "link": link, "published_dt": published_dt})
 
     return items
 
 
-def _fetch_feed(url: str, timeout_s: int = 20) -> list[dict]:
+def _fetch_feed(url: str, timeout_s: int = 25) -> list[dict]:
     headers = {
         "User-Agent": UA,
         "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
@@ -179,49 +205,32 @@ def _fetch_feed(url: str, timeout_s: int = 20) -> list[dict]:
     try:
         r = requests.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
         ct = (r.headers.get("Content-Type") or "").lower()
-        if DEBUG:
-            print("[news] GET", url, "->", r.status_code, ct)
+        _debug("GET", url, "->", r.status_code, ct)
 
         r.raise_for_status()
 
         items = _parse_rss_or_atom(r.content)
-        if DEBUG:
-            print("[news] items:", len(items), "from", url)
-
+        _debug("items:", len(items), "from", url)
         return items
     except Exception as e:
-        if DEBUG:
-            print("[news] Feed failed:", url, "err:", repr(e))
+        _debug("Feed failed:", url, "err:", repr(e))
         return []
 
 
 def _dedupe(items: list[dict]) -> list[dict]:
-    """
-    Basic dedupe by normalized (title, link).
-    AI clustering later will handle deeper dedupe.
-    """
     seen = set()
     out = []
     for it in items:
         t = (it.get("title") or "").strip().lower()
         l = (it.get("link") or "").strip()
-        key = (t, l)
         if not t or not l:
             continue
+        key = (t, l)
         if key in seen:
             continue
         seen.add(key)
         out.append(it)
     return out
-
-def _unwrap_google_news(url: str, timeout_s: int = 10) -> str:
-    if "news.google.com" not in (url or ""):
-        return url
-    try:
-        r = requests.get(url, headers={"User-Agent": UA}, timeout=timeout_s, allow_redirects=True)
-        return r.url or url  # final redirected URL (often biospace.com, reuters.com, etc.)
-    except Exception:
-        return url
 
 
 # ----------------------------
@@ -229,11 +238,9 @@ def _unwrap_google_news(url: str, timeout_s: int = 10) -> str:
 # ----------------------------
 def fetch_last_24h(limit_per_feed: int = 40) -> list[dict]:
     """
-    Returns a list of dicts:
+    Returns list of:
       { "title": str, "link": str, "published_dt": datetime|None }
-    Notes:
-      - If published_dt can't be parsed, the item is kept (important).
-      - We do our own last-24h filter; Google News query includes when:1d but we still filter.
+    Keeps items even if published_dt couldn't be parsed.
     """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=24)
@@ -253,14 +260,17 @@ def fetch_last_24h(limit_per_feed: int = 40) -> list[dict]:
     for it in all_items:
         published_dt = it.get("published_dt")
 
-        # ✅ key fix: only filter if we successfully parsed date
+        # ✅ Only filter if we successfully parsed a date
         if published_dt is not None and published_dt < cutoff:
             continue
 
         recent_items.append(it)
 
-    # Sort newest first; undated items go last
-    recent_items.sort(key=lambda x: x["published_dt"] or datetime(1970, 1, 1, tzinfo=timezone.utc), reverse=True)
+    # Newest first; undated items last
+    recent_items.sort(
+        key=lambda x: x["published_dt"] or datetime(1970, 1, 1, tzinfo=timezone.utc),
+        reverse=True,
+    )
 
     _debug("After 24h filter:", len(recent_items))
     return recent_items
