@@ -38,7 +38,7 @@ BLOCKED_DOMAINS = {
     "businessreport.co.za",
 
     # google wrapper (we want the underlying source)
-    "news.google.com",
+    
 
     # any other recurring low-quality sources you notice
     "parameter.io",
