@@ -49,9 +49,6 @@ def _groq_chat(
 
 
 def _extract_first_json_block(text: str) -> str:
-    """
-    Extract the first {...} or [...] block from a string.
-    """
     text = (text or "").strip()
     start = None
     for i, ch in enumerate(text):
@@ -68,15 +65,10 @@ def _extract_first_json_block(text: str) -> str:
             break
     if end is None or end <= start:
         raise ValueError(f"No JSON end found. First 200 chars:\n{text[:200]}")
-
     return text[start:end]
 
 
 def _repair_json_with_groq(bad_json: str) -> str:
-    """
-    Ask Groq to repair invalid JSON into valid JSON.
-    One extra call only when needed.
-    """
     system = {"role": "system", "content": "You fix JSON. Return ONLY valid JSON. No commentary."}
     user = {
         "role": "user",
@@ -90,10 +82,6 @@ def _repair_json_with_groq(bad_json: str) -> str:
 
 
 def _parse_json_strict(text: str, *, repair: bool = True) -> Any:
-    """
-    Parse model output as JSON.
-    If parsing fails and repair=True, ask Groq to repair the JSON once.
-    """
     text = (text or "").strip()
 
     # 1) direct parse
@@ -102,25 +90,18 @@ def _parse_json_strict(text: str, *, repair: bool = True) -> Any:
     except Exception:
         pass
 
-    # 2) extract first JSON block and parse
+    # 2) parse extracted block
     try:
         block = _extract_first_json_block(text)
         return json.loads(block)
-    except Exception as e1:
+    except Exception:
         if not repair:
             raise
 
-    # 3) repair once via Groq, then parse again
-    try:
-        repaired = _repair_json_with_groq(_extract_first_json_block(text))
-        repaired_block = _extract_first_json_block(repaired)
-        return json.loads(repaired_block)
-    except Exception as e2:
-        # Raise a helpful error (won't be huge)
-        raise ValueError(
-            "Failed to parse JSON even after repair.\n"
-            f"Original (first 300 chars): {text[:300]}\n"
-        ) from e2
+    # 3) repair once
+    repaired = _repair_json_with_groq(_extract_first_json_block(text))
+    repaired_block = _extract_first_json_block(repaired)
+    return json.loads(repaired_block)
 
 
 # ----------------------------
@@ -137,7 +118,7 @@ def ai_cluster_headlines(items: List[Dict[str, str]]) -> Dict[str, Any]:
         "role": "user",
         "content": (
             "Cluster these news items so that items about the SAME underlying event are grouped together.\n"
-            "Use ONLY titles and sources. Be conservative (don't over-merge).\n"
+            "Use ONLY titles and sources. Be conservative: only merge if clearly the same event.\n"
             "Return JSON only with schema:\n"
             "{clusters:[{cluster_id:int,item_ids:[int],representative_id:int,label:string}]}\n\n"
             "Items:\n"
@@ -169,10 +150,6 @@ def ai_cluster_headlines(items: List[Dict[str, str]]) -> Dict[str, Any]:
             }
         )
 
-    # Safety: if model returns nothing usable, treat as no clustering
-    if not cleaned:
-        return {"clusters": []}
-
     return {"clusters": cleaned}
 
 
@@ -197,10 +174,17 @@ def ai_extract_structured(items: List[Dict[str, str]]) -> Dict[str, Any]:
             "Categories must be one of:\n"
             "Financings; IPOs/Public markets; M&A/Licensing; Clinical readouts/Safety; "
             "FDA/EMA Regulatory; Pharma/Big biotech; Nordic/European biotech; Other\n\n"
-            "Rules:\n"
-            "- materiality: low/medium/high (VC relevance)\n"
-            "- one_line_summary: exactly 1 sentence\n"
-            "- vc_takeaway: exactly 1 sharp sentence\n\n"
+            "Classification rules:\n"
+            "- Analyst notes / price-target changes / stock-move commentary are NOT 'Financings' => use 'IPOs/Public markets'.\n"
+            "- Put something in 'M&A/Licensing' ONLY if the transaction/partnership itself is the news (not merely mentioned).\n"
+            "- Thought-leadership / marketing / event promotions => 'Other' with low materiality.\n\n"
+            "Output rules:\n"
+            "- materiality must be low/medium/high and reflect VC relevance.\n"
+            "- one_line_summary MUST be exactly 1 sentence.\n"
+            "- vc_takeaway MUST be exactly 1 sentence AND include one concrete angle specific to the story.\n"
+            "  Examples of acceptable angles: deal structure (upfront/milestones), label scope, safety signal type,\n"
+            "  endpoint effect size, competitive landscape/comps, payer risk, manufacturing/CMC risk, next catalyst.\n"
+            "  Avoid generic phrases like 'may impact' or 'marks a milestone' unless paired with a specific catalyst.\n\n"
             "Items:\n"
             + "\n\n".join(
                 [
@@ -211,7 +195,7 @@ def ai_extract_structured(items: List[Dict[str, str]]) -> Dict[str, Any]:
         ),
     }
 
-    txt = _groq_chat([system, user], max_tokens=2200, temperature=0.2)
+    txt = _groq_chat([system, user], max_tokens=2400, temperature=0.2)
     data = _parse_json_strict(txt, repair=True)
 
     items_out = data.get("items") if isinstance(data, dict) else None
@@ -261,8 +245,8 @@ def ai_extract_structured(items: List[Dict[str, str]]) -> Dict[str, Any]:
                 "regulator": x.get("regulator"),
                 "geography": x.get("geography"),
                 "materiality": mat,
-                "one_line_summary": x.get("one_line_summary") or "",
-                "vc_takeaway": x.get("vc_takeaway") or "",
+                "one_line_summary": (x.get("one_line_summary") or "").strip(),
+                "vc_takeaway": (x.get("vc_takeaway") or "").strip(),
             }
         )
 
@@ -270,15 +254,13 @@ def ai_extract_structured(items: List[Dict[str, str]]) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Compatibility single-item helper (in case older code imports it)
+# Compatibility single-item helper (kept in case older code imports it)
 # ----------------------------
 def ai_summarize_takeaway(title: str, url: str, category: str, article_text: str) -> dict:
     snippet = (article_text or "").strip().replace("\n", " ")
     snippet = snippet[:1200]
 
-    out = ai_extract_structured(
-        [{"id": 0, "title": title, "url": url, "source": "", "snippet": snippet}]
-    )
+    out = ai_extract_structured([{"id": 0, "title": title, "url": url, "source": "", "snippet": snippet}])
     items = out.get("items", [])
     if not items:
         return {"summary": "", "vc_takeaway": "", "materiality": "medium"}
@@ -319,23 +301,4 @@ Filing text:
     }
 
     txt = _groq_chat([system, user], max_tokens=700, temperature=0.1)
-    return _parse_json_strict(txt, repair=True)
-
-
-def ai_filter_stale_deals(items: list[dict]) -> dict:
-    """
-    Input: [{id, title, snippet}]
-    Output: { keep_ids:[int], stale_ids:[int] }
-    """
-    system = {"role": "system", "content": "Return valid JSON only. No markdown."}
-    user = {
-        "role": "user",
-        "content": (
-            "For each item, decide if it is a NEWLY ANNOUNCED deal in the last ~24h "
-            "vs an older deal being discussed/recapped.\n"
-            "Return JSON: {keep_ids:[...], stale_ids:[...]}.\n\n"
-            + "\n\n".join([f"ID:{it['id']}\nTITLE:{it['title']}\nSNIPPET:{it.get('snippet','')[:1200]}" for it in items])
-        ),
-    }
-    txt = _groq_chat([system, user], max_tokens=900, temperature=0.0)
     return _parse_json_strict(txt, repair=True)
