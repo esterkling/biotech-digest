@@ -9,6 +9,137 @@ from typing import Optional, Dict, Any, Tuple
 import requests
 from bs4 import BeautifulSoup
 
+import difflib
+
+# --- Ticker detection helpers (NEW) ---
+
+# Common patterns in headlines
+_TICKER_PARENS_RE = re.compile(r"\(([A-Z]{1,6})\)")
+_TICKER_EXCH_RE = re.compile(r"\b(?:NASDAQ|Nasdaq|NYSE|Nyse|AMEX|Amex)\s*:\s*([A-Z]{1,6})\b")
+_TICKER_DASH_RE = re.compile(r"\b([A-Z]{1,6})\s*-\s*(?:NASDAQ|NYSE|AMEX)\b")
+
+# IPO-ish phrases for company-name extraction
+_IPO_PHRASE_SPLIT_RE = re.compile(
+    r"\b(prices|priced|sets terms|files|filed|launches|plans|seeks|targets)\b.*\b(ipo|s-1|f-1|nasdaq|nyse)\b",
+    re.IGNORECASE
+)
+
+# Cache SEC ticker map in memory for the run
+_TICKER_MAP_CACHE = None  # type: ignore
+
+def _load_sec_ticker_map(user_agent: str):
+    """
+    Returns list of dicts with: ticker, name, cik
+    Cached per run.
+    """
+    global _TICKER_MAP_CACHE
+    if _TICKER_MAP_CACHE is not None:
+        return _TICKER_MAP_CACHE
+
+    data = _sec_get(SEC_TICKER_MAP_URL, user_agent).json()
+    rows = []
+    for _, row in data.items():
+        name = (row.get("title") or "").strip()
+        ticker = (row.get("ticker") or "").strip().upper()
+        cik = row.get("cik_str")
+        if name and ticker and cik:
+            rows.append({"ticker": ticker, "name": name, "cik": str(cik).zfill(10)})
+
+    _TICKER_MAP_CACHE = rows
+    return rows
+
+def _normalize_name(s: str) -> str:
+    s = s.lower()
+    # drop punctuation-ish chars
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    # collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    # remove common suffixes
+    for suf in ["inc", "incorporated", "ltd", "limited", "plc", "corp", "corporation", "ag", "sa", "ab", "bv", "nv", "holdings", "group"]:
+        s = re.sub(rf"\b{suf}\b", "", s).strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _extract_company_name_from_headline(title: str) -> str | None:
+    """
+    Best-effort: take the chunk before typical IPO verbs/phrases,
+    or before separators like ':' or ' - '.
+    """
+    # Remove source suffixes sometimes embedded in Google News titles: " - Outlet"
+    base = re.split(r"\s+-\s+", title, maxsplit=1)[0].strip()
+
+    # If "Company XYZ prices IPO..." exists, take left side before the IPO phrase
+    m = _IPO_PHRASE_SPLIT_RE.search(base)
+    if m:
+        left = base[:m.start()].strip()
+        if 2 <= len(left) <= 80:
+            return left
+
+    # Otherwise split on ':' (e.g., "Generate Biomedicines: files S-1")
+    if ":" in base:
+        left = base.split(":", 1)[0].strip()
+        if 2 <= len(left) <= 80:
+            return left
+
+    # Otherwise use first ~6 words as a rough company candidate
+    words = base.split()
+    if len(words) >= 2:
+        return " ".join(words[:6]).strip()
+
+    return None
+
+def _fuzzy_name_to_ticker(company_name: str, user_agent: str) -> str | None:
+    """
+    Fuzzy match company name against SEC company names.
+    Uses stdlib difflib (no external dependency).
+    """
+    rows = _load_sec_ticker_map(user_agent)
+    target = _normalize_name(company_name)
+    if not target or len(target) < 3:
+        return None
+
+    # Build list of normalized names to match against
+    names = [_normalize_name(r["name"]) for r in rows]
+
+    # difflib returns close matches by sequence similarity
+    matches = difflib.get_close_matches(target, names, n=1, cutoff=0.88)
+    if not matches:
+        return None
+
+    best_norm = matches[0]
+    idx = names.index(best_norm)
+    return rows[idx]["ticker"]
+
+def guess_ticker_from_text(title: str, user_agent: str) -> str | None:
+    """
+    Best-effort ticker extraction from a headline.
+    1) (TICKER)
+    2) NASDAQ:TICKER / NYSE:TICKER
+    3) TICKER - NASDAQ
+    4) Fuzzy match company name -> ticker via SEC map
+    """
+    # 1) (TICKER)
+    m = _TICKER_PARENS_RE.search(title)
+    if m:
+        return m.group(1).upper()
+
+    # 2) NASDAQ:TICKER
+    m = _TICKER_EXCH_RE.search(title)
+    if m:
+        return m.group(1).upper()
+
+    # 3) TICKER - NASDAQ
+    m = _TICKER_DASH_RE.search(title)
+    if m:
+        return m.group(1).upper()
+
+    # 4) Fuzzy company name
+    cname = _extract_company_name_from_headline(title)
+    if cname:
+        return _fuzzy_name_to_ticker(cname, user_agent)
+
+    return None
+
 SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 
 # Priority order for IPO-related filings
