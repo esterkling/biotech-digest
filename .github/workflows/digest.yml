@@ -34,5 +34,8 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           FORCE_SEND: ${{ github.event.inputs.force_send }}
           DEBUG_NEWS: "1"
+          GOOGLE_UNWRAP_CAP: "30"
+          PER_FEED_LIMIT: "40"
+          NEWS_TIMEOUT_S: "25"
         run: |
           python digest.py
