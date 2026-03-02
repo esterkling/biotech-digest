@@ -161,8 +161,9 @@ def build_digest_text() -> str:
 
 
 def main():
-    # For manual testing, you can comment this out temporarily.
-    if not should_run_now_stockholm():
+    force_send = os.environ.get("FORCE_SEND", "").lower() in ("1", "true", "yes")
+
+    if not force_send and not should_run_now_stockholm():
         print("Not 08:00 Stockholm time, exiting.")
         return
 
