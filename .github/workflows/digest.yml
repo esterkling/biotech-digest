@@ -5,6 +5,11 @@ on:
     - cron: "0 6 * * *"
     - cron: "0 7 * * *"
   workflow_dispatch:
+  inputs:
+    force_send:
+      description: "Post to Slack even if not 08:00 Stockholm time"
+      required: false
+      default: "false"
 
 jobs:
   run-digest:
@@ -26,5 +31,6 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          FORCE_SEND: ${{ github.event.inputs.force_send }}
         run: |
           python digest.py
