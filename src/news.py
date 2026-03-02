@@ -182,13 +182,24 @@ def _fetch_feed(url: str, timeout_s: int = 20) -> list[dict]:
     headers = {
         "User-Agent": UA,
         "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     try:
-        r = requests.get(url, headers=headers, timeout=timeout_s)
+        r = requests.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if DEBUG:
+            print("[news] GET", url, "->", r.status_code, ct)
+
         r.raise_for_status()
-        return _parse_rss_or_atom(r.content)
+
+        items = _parse_rss_or_atom(r.content)
+        if DEBUG:
+            print("[news] items:", len(items), "from", url)
+
+        return items
     except Exception as e:
-        _debug("Feed failed:", url, "err:", repr(e))
+        if DEBUG:
+            print("[news] Feed failed:", url, "err:", repr(e))
         return []
 
 
