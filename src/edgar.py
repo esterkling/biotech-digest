@@ -492,3 +492,79 @@ def edgar_private_price_analysis_from_cik(
         "step_up_down_pct": step,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
+
+def extract_relevant_ipo_sections(html: str) -> str:
+    """
+    Pull text with a bias toward sections that usually contain recent private round prices.
+    Keeps size small for the LLM.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text("\n", strip=True)
+
+    # Try to capture around keywords that commonly include the relevant info
+    keywords = [
+        "Recent Sales of Unregistered Securities",
+        "Dilution",
+        "Capitalization",
+        "Private Placement",
+        "preferred stock",
+        "price per share",
+        "stockholders' equity",
+    ]
+
+    lines = text.split("\n")
+    out = []
+    for i, ln in enumerate(lines):
+        for kw in keywords:
+            if kw.lower() in ln.lower():
+                start = max(0, i - 20)
+                end = min(len(lines), i + 180)
+                out.append("\n".join(lines[start:end]))
+                break
+
+    # Fallback: first chunk
+    if not out:
+        out = ["\n".join(lines[:600])]
+
+    # De-dupe chunks
+    seen = set()
+    uniq = []
+    for c in out:
+        c2 = c.strip()
+        if c2 and c2 not in seen:
+            seen.add(c2)
+            uniq.append(c2)
+
+    return "\n\n---\n\n".join(uniq)[:12000]
+
+from src.ai import ai_parse_edgar_last_private_round
+
+def edgar_private_price_analysis_ai_from_cik(cik10: str, user_agent: str, company_name: str | None = None, ticker: str | None = None) -> dict:
+    subs = get_company_submissions(cik10, user_agent)
+    filing = pick_latest_ipo_filing(subs)
+    if not filing:
+        return {"error": "No IPO-related filings found", "last_private_round_price_per_share": None}
+
+    html = download_filing_html(cik10, filing["accession"], filing["primary_doc"], user_agent)
+    relevant_text = extract_relevant_ipo_sections(html)
+
+    filing_url = filing_primary_doc_url(cik10, filing["accession"], filing["primary_doc"])
+    context = {"company_name": company_name, "ticker": ticker, "filing_url": filing_url, "form": filing["form"], "filing_date": filing["date"]}
+
+    ai = ai_parse_edgar_last_private_round(relevant_text, context)
+
+    return {
+        "ticker": ticker,
+        "company_name": company_name,
+        "cik": cik10,
+        "filing_form_used": filing["form"],
+        "filing_accession": filing["accession"],
+        "filing_date": filing["date"],
+        "filing_url": filing_url,
+        "last_private_round_price_per_share": ai.get("last_private_round_price_per_share"),
+        "currency": ai.get("currency", "USD"),
+        "extraction_confidence": ai.get("confidence", 0.0),
+        "supporting_snippet": ai.get("supporting_quote"),
+        "extraction_rationale": ai.get("reasoning"),
+        "ai_reasoning": ai.get("reasoning"),
+    }
