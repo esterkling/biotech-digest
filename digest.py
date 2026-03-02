@@ -3,164 +3,314 @@ import os
 from datetime import datetime
 from dateutil import tz
 
-from src.news import fetch_last_24h, categorize, materiality_score
+from src.news import fetch_last_24h
 from src.slack import post
-from src.edgar import edgar_private_price_analysis, guess_ticker_from_text
-from src.ai import ai_summarize_takeaway
 from src.extract import extract_article_text
+
 from src.ai import ai_cluster_headlines, ai_extract_structured
 
+from src.edgar import (
+    guess_ticker_from_text,
+    extract_company_name_from_headline,
+    edgar_private_price_analysis,
+    edgar_private_price_analysis_from_company,
+)
 
+
+# -----------------------
+# Scheduling / gating
+# -----------------------
 def should_run_now_stockholm() -> bool:
-    """
-    Your workflow runs twice/day; this ensures you post only once at 08:00 Stockholm time (DST-safe).
-    """
     now = datetime.now(tz=tz.gettz("Europe/Stockholm"))
     return now.hour == 8
 
 
+def is_force_send() -> bool:
+    return os.environ.get("FORCE_SEND", "").lower() in ("1", "true", "yes", "y")
+
+
+# -----------------------
+# Slack formatting
+# -----------------------
 def slack_link(url: str, title: str) -> str:
-    """
-    Slack "pretty link" format: <url|text>
-    """
     title = (title or "").replace("\n", " ").strip()
     if len(title) > 95:
         title = title[:92] + "..."
     return f"<{url}|{title}>"
 
 
-def item_takeaway(category: str, title: str) -> str:
+def slack_plain(url: str, label: str = "alt") -> str:
+    return f"<{url}|{label}>"
+
+
+def host_from_url(url: str) -> str:
+    try:
+        return url.split("/")[2].lower()
+    except Exception:
+        return ""
+
+
+def section_name(ai_category: str) -> str:
+    mapping = {
+        "Financings": "💰 Financings",
+        "IPOs/Public markets": "🚀 IPOs / Public markets",
+        "M&A/Licensing": "🤝 M&A and licensing",
+        "Clinical readouts/Safety": "🧪 Clinical readouts / safety",
+        "FDA/EMA Regulatory": "🏛️ FDA / EMA regulatory",
+        "Pharma/Big biotech": "💊 Pharma / big biotech",
+        "Nordic/European biotech": "🌍 Nordic / European biotech",
+        "Other": "🗞️ Other notable biotech",
+    }
+    return mapping.get(ai_category, "🗞️ Other notable biotech")
+
+
+def is_ipo_category(ai_category: str) -> bool:
+    return ai_category.strip().lower() == "ipos/public markets".lower()
+
+
+# -----------------------
+# EDGAR enrichment (IPO only)
+# -----------------------
+def edgar_for_ipo(title: str, user_agent: str) -> dict:
+    ticker = guess_ticker_from_text(title, user_agent)
+    if ticker:
+        return edgar_private_price_analysis(ticker, user_agent)
+
+    cname = extract_company_name_from_headline(title)
+    if cname:
+        return edgar_private_price_analysis_from_company(cname, user_agent)
+
+    return {"error": "Could not infer ticker or company name", "last_private_round_price_per_share": None}
+
+
+# -----------------------
+# AI pipeline
+# -----------------------
+def build_clusters(raw_items: list[dict]) -> tuple[list[dict], dict[int, list[int]]]:
     """
-    One-sentence VC takeaway per item (heuristic).
+    Returns:
+      reps: representative items [{id,title,url,source}, ...]
+      rep_to_other_ids: rep_id -> other raw item ids in same cluster
     """
-    t = title.lower()
-
-    article_text = extract_article_text(link)
-
-try:
-    ai_data = ai_summarize_takeaway(title, link, cat, article_text)
-
-    summary = ai_data.get("summary", "")
-    takeaway = ai_data.get("vc_takeaway", "")
-    materiality = ai_data.get("materiality", "medium")
-
-    lines.append(f"  ↳ {summary}")
-    lines.append(f"  ↳ *VC Takeaway:* {takeaway} ({materiality})")
-
-except Exception as e:
-    lines.append("  ↳ AI summary unavailable.")
-
-def build_top3(cats: dict[str, list[dict]]) -> list[dict]:
-    """
-    Build a “Top 3 most material” list across all categories using heuristic scoring.
-    """
-    flat = []
-    for cat, bucket in cats.items():
-        for it in bucket:
-            flat.append({
-                "category": cat,
+    cluster_input = []
+    for idx, it in enumerate(raw_items):
+        cluster_input.append(
+            {
+                "id": idx,
                 "title": it["title"],
-                "link": it["link"],
-                "score": materiality_score(it["title"], cat)
-            })
-    flat.sort(key=lambda x: x["score"], reverse=True)
-    return flat[:3]
+                "url": it["link"],
+                "source": host_from_url(it["link"]),
+            }
+        )
+
+    out = ai_cluster_headlines(cluster_input)
+    clusters = out.get("clusters", [])
+
+    if not clusters:
+        reps = cluster_input
+        rep_to_other_ids = {it["id"]: [] for it in reps}
+        return reps, rep_to_other_ids
+
+    reps = []
+    rep_to_other_ids: dict[int, list[int]] = {}
+    seen = set()
+
+    for c in clusters:
+        rep_id = int(c.get("representative_id"))
+        ids = [int(x) for x in c.get("item_ids", []) if isinstance(x, int) or str(x).isdigit()]
+        if rep_id < 0 or rep_id >= len(cluster_input):
+            continue
+        if rep_id in seen:
+            continue
+        seen.add(rep_id)
+
+        reps.append(cluster_input[rep_id])
+        rep_to_other_ids[rep_id] = [i for i in ids if i != rep_id and 0 <= i < len(cluster_input)]
+
+    if not reps:
+        reps = cluster_input
+        rep_to_other_ids = {it["id"]: [] for it in reps}
+
+    return reps, rep_to_other_ids
 
 
+def build_structured(reps: list[dict], snippet_chars: int = 1200, max_items: int = 25) -> dict[int, dict]:
+    """
+    One batch call: categorization + one-line summary + VC takeaway.
+    """
+    reps = reps[:max_items]
+    extract_input = []
+
+    for r in reps:
+        txt = extract_article_text(r["url"])
+        snippet = (txt or "").strip().replace("\n", " ")
+        snippet = snippet[:snippet_chars]
+
+        extract_input.append(
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "url": r["url"],
+                "source": r.get("source", ""),
+                "snippet": snippet,
+            }
+        )
+
+    out = ai_extract_structured(extract_input)
+    items = out.get("items", [])
+    return {int(x["id"]): x for x in items if isinstance(x, dict) and "id" in x}
+
+
+# -----------------------
+# Digest builder
+# -----------------------
 def build_digest_text() -> str:
     ua = os.environ["SEC_USER_AGENT"]
 
-    items = fetch_last_24h()
-    cats = categorize(items)
-    top3 = build_top3(cats)
+    raw_items = fetch_last_24h()
+    if not raw_items:
+        return "*Daily Biotech Digest* — (no items found in last ~24h)"
+
+    # A) Deduplicate via AI clustering
+    reps, rep_to_others = build_clusters(raw_items)
+
+    # B) AI categorize + summarize + VC takeaway (batch)
+    structured_by_id = build_structured(reps)
+
+    # Bucket by AI category
+    bucket_order = [
+        "IPOs/Public markets",
+        "Financings",
+        "M&A/Licensing",
+        "Clinical readouts/Safety",
+        "FDA/EMA Regulatory",
+        "Pharma/Big biotech",
+        "Nordic/European biotech",
+        "Other",
+    ]
+    buckets = {k: [] for k in bucket_order}
+
+    scored = []
+    for r in reps[:25]:
+        s = structured_by_id.get(r["id"], {})
+        cat = s.get("category", "Other")
+        if cat not in buckets:
+            cat = "Other"
+        buckets[cat].append(r)
+
+        mat = (s.get("materiality") or "medium").strip().lower()
+        score = {"high": 3, "medium": 2, "low": 1}.get(mat, 2)
+        scored.append((score, r))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top3 = [r for _, r in scored[:3]]
 
     now_local = datetime.now(tz=tz.gettz("Europe/Stockholm"))
     lines: list[str] = []
     lines.append(f"*Daily Biotech Digest* — {now_local.strftime('%Y-%m-%d')} (last ~24h)")
     lines.append("")
 
-    # --- Top 3 ---
-    lines.append("*🔥 Top 3 most material items*")
+    # Top 3
+    lines.append("*🔥 Top 3 most material*")
     if not top3:
-        lines.append("• (No major items surfaced in this feed window.)")
+        lines.append("• (No major items surfaced.)")
     else:
-        for x in top3:
-            lines.append(f"• [{x['category']}] {slack_link(x['link'], x['title'])}")
-            lines.append(f"  ↳ {item_takeaway(x['category'], x['title'])}")
+        for r in top3:
+            s = structured_by_id.get(r["id"], {})
+            cat = s.get("category", "Other")
+            summary = (s.get("one_line_summary") or "").strip()
+            takeaway = (s.get("vc_takeaway") or "").strip()
+            mat = (s.get("materiality") or "medium").strip()
+
+            lines.append(f"• [{section_name(cat)}] {slack_link(r['url'], r['title'])}")
+            if summary:
+                lines.append(f"  ↳ {summary}")
+            if takeaway:
+                lines.append(f"  ↳ *VC Takeaway:* {takeaway} ({mat})")
+
+            other_ids = rep_to_others.get(r["id"], [])
+            if other_ids:
+                alt_urls = []
+                for oid in other_ids[:2]:
+                    try:
+                        alt_urls.append(raw_items[oid]["link"])
+                    except Exception:
+                        pass
+                if alt_urls:
+                    lines.append("  ↳ Also covered by: " + " / ".join([slack_plain(u) for u in alt_urls]))
     lines.append("")
 
-    # --- IPO section first, with EDGAR enrichment ---
-    ipo_cat = "🚀 IPOs / Public markets"
-    ipo_items = cats.get(ipo_cat, [])
-
-    lines.append(f"*{ipo_cat}*")
-    if not ipo_items:
-        lines.append("• None detected in the last 24 hours.")
-    else:
-        for it in ipo_items:
-            title, link = it["title"], it["link"]
-            lines.append(f"• {slack_link(link, title)}")
-            lines.append(f"  ↳ {item_takeaway(ipo_cat, title)}")
-
-            # Improved ticker guessing
-            ticker = guess_ticker_from_text(title, ua)
-            if not ticker:
-                lines.append("  ↳ EDGAR: could not infer ticker from headline.")
-                continue
-
-            analysis = edgar_private_price_analysis(ticker, ua)
-            p = analysis.get("last_private_round_price_per_share")
-            conf = analysis.get("extraction_confidence", 0.0)
-            filing = analysis.get("filing_form_used")
-            fdate = analysis.get("filing_date")
-            furl = analysis.get("filing_url")
-
-            if p:
-                lines.append(f"  ↳ EDGAR ({ticker}): last private price/share (best-effort) *${p}* (conf {conf:.2f})")
-                if filing and fdate and furl:
-                    lines.append(f"  ↳ Source: {filing} filed {fdate} — {slack_link(furl, 'SEC filing')}")
-            else:
-                lines.append(f"  ↳ EDGAR ({ticker}): could not reliably extract last private price/share (conf {conf:.2f}).")
-                if furl:
-                    lines.append(f"  ↳ Filing: {slack_link(furl, 'SEC filing')}")
-    lines.append("")
-
-    # --- Other categories ---
-    order = [
-        "💰 Financings",
-        "🤝 M&A and licensing",
-        "🧪 Clinical readouts / safety",
-        "🏛️ FDA / EMA regulatory",
-        "💊 Pharma / big biotech",
-        "🌍 Nordic / European biotech",
-        "🗞️ Other notable biotech",
-    ]
-
-    for cat in order:
-        bucket = cats.get(cat, [])
-        lines.append(f"*{cat}*")
+    # Sections
+    for cat in bucket_order:
+        lines.append(f"*{section_name(cat)}*")
+        bucket = buckets.get(cat, [])
         if not bucket:
-            lines.append("• (No major items surfaced in this feed window.)")
-        else:
-            for it in bucket:
-                title, link = it["title"], it["link"]
-                lines.append(f"• {slack_link(link, title)}")
-                lines.append(f"  ↳ {item_takeaway(cat, title)}")
+            lines.append("• (No major items surfaced in this window.)")
+            lines.append("")
+            continue
+
+        for r in bucket:
+            s = structured_by_id.get(r["id"], {})
+            summary = (s.get("one_line_summary") or "").strip()
+            takeaway = (s.get("vc_takeaway") or "").strip()
+            mat = (s.get("materiality") or "medium").strip()
+
+            lines.append(f"• {slack_link(r['url'], r['title'])}")
+            if summary:
+                lines.append(f"  ↳ {summary}")
+            if takeaway:
+                lines.append(f"  ↳ *VC Takeaway:* {takeaway} ({mat})")
+
+            # IPO EDGAR enrichment
+            if is_ipo_category(cat):
+                try:
+                    ed = edgar_for_ipo(r["title"], ua)
+                    p = ed.get("last_private_round_price_per_share")
+                    conf = ed.get("extraction_confidence", 0.0)
+                    furl = ed.get("filing_url")
+                    err = ed.get("error")
+
+                    if p is not None:
+                        lines.append(f"  ↳ *EDGAR:* last private price/share (best-effort) *${p}* (conf {conf:.2f})")
+                    elif err:
+                        lines.append(f"  ↳ *EDGAR:* {err}")
+                    else:
+                        lines.append(f"  ↳ *EDGAR:* could not extract last private price/share (conf {conf:.2f}).")
+
+                    if furl:
+                        lines.append(f"  ↳ Filing: {slack_link(furl, 'SEC filing')}")
+                except Exception:
+                    lines.append("  ↳ EDGAR enrichment unavailable.")
+
+            other_ids = rep_to_others.get(r["id"], [])
+            if other_ids:
+                alt_urls = []
+                for oid in other_ids[:2]:
+                    try:
+                        alt_urls.append(raw_items[oid]["link"])
+                    except Exception:
+                        pass
+                if alt_urls:
+                    lines.append("  ↳ Also covered by: " + " / ".join([slack_plain(u) for u in alt_urls]))
+
         lines.append("")
 
     return "\n".join(lines).strip()
 
 
 def main():
-    force_send = os.environ.get("FORCE_SEND", "").lower() in ("1", "true", "yes")
-
-    if not force_send and not should_run_now_stockholm():
-        print("Not 08:00 Stockholm time, exiting.")
+    # Only post at 08:00 Stockholm unless forced
+    if not is_force_send() and not should_run_now_stockholm():
+        print("Not 08:00 Stockholm time and FORCE_SEND not set; exiting.")
         return
 
-    slack_url = os.environ["SLACK_WEBHOOK_URL"]
+    # Required env vars (fail fast with clear error)
+    _ = os.environ["SLACK_WEBHOOK_URL"]
+    _ = os.environ["SEC_USER_AGENT"]
+    _ = os.environ["GROQ_API_KEY"]
+
     text = build_digest_text()
-    post(slack_url, text)
+    post(os.environ["SLACK_WEBHOOK_URL"], text)
     print("Posted digest to Slack.")
 
 
