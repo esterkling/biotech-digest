@@ -10,10 +10,10 @@ from src.edgar import edgar_private_price_analysis, guess_ticker_from_text
 
 def should_run_now_stockholm() -> bool:
     """
-    Your workflow runs twice/day; this ensures you post only once at 08:00 Stockholm time (DST-safe).
+    #Your workflow runs twice/day; this ensures you post only once at 08:00 Stockholm time (DST-safe).
     """
-    now = datetime.now(tz=tz.gettz("Europe/Stockholm"))
-    return now.hour == 8
+    #now = datetime.now(tz=tz.gettz("Europe/Stockholm"))
+    #return now.hour == 8
 
 
 def slack_link(url: str, title: str) -> str:
