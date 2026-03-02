@@ -11,58 +11,87 @@ import xml.etree.ElementTree as ET
 
 import requests
 
-
 # ----------------------------
-# Configuration
+# Config
 # ----------------------------
-UA = (
+UA = os.environ.get(
+    "NEWS_USER_AGENT",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 )
-
 DEBUG = os.environ.get("DEBUG_NEWS", "").lower() in ("1", "true", "yes", "y")
 
-# Only unwrap a limited number of Google News links to avoid hundreds of extra requests
-GOOGLE_UNWRAP_CAP = int(os.environ.get("GOOGLE_UNWRAP_CAP", "20"))
+GOOGLE_UNWRAP_CAP = int(os.environ.get("GOOGLE_UNWRAP_CAP", "30"))
+PER_FEED_LIMIT = int(os.environ.get("PER_FEED_LIMIT", "40"))
 
+REQUEST_TIMEOUT_S = int(os.environ.get("NEWS_TIMEOUT_S", "25"))
 
 # ----------------------------
-# Feeds (free sources)
+# "Guaranteed" direct sources
+# (official RSS where available)
 # ----------------------------
-BASE_FEEDS = [
-    "https://www.fiercebiotech.com/rss/xml",
+DIRECT_FEEDS = [
+    # BioSpace RSS list: https://www.biospace.com/rss-feeds  (All News & category feeds)
+    "https://www.biospace.com/all-news.rss",
+    "https://www.biospace.com/deals.rss",
+    "https://www.biospace.com/fda.rss",
+    "https://www.biospace.com/drug-development.rss",
+    "https://www.biospace.com/business.rss",
+
+    # BioPharma Dive
     "https://www.biopharmadive.com/feeds/news/",
-    # These often block GitHub runners; keep commented unless proven working:
-    # "https://www.globenewswire.com/RssFeed/subjectcode/HEA",
-    # "https://www.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRX0I=",
+
+    # Fierce Biotech RSS list: https://www.fiercebiotech.com/fiercebiotechcom/rss-feeds
+    "https://www.fiercebiotech.com/rss/xml",
+
+    # STAT RSS list: https://www.statnews.com/rss-feeds/
+    "https://www.statnews.com/feed/",
+    "https://www.statnews.com/category/biotech/feed/",
+    "https://www.statnews.com/category/pharma/feed/",
 ]
 
-GOOGLE_NEWS_QUERIES = [
-    "biotech acquisition deal",
-    "biotech licensing deal upfront",
-    "biotech partnership deal",
-    "pharma acquisition deal",
-    "FDA approval biotech",
-    "EMA CHMP positive opinion biotech",
-    "clinical trial readout Phase 2",
-    "clinical trial readout Phase 3",
-    "biotech safety hold FDA",
-    "biotech financing Series A",
-    "biotech financing Series B",
-    "biotech IPO filing S-1",
-    "Nordic biotech financing",
-    "Sweden biotech",
-    "Denmark biotech",
-    "Norway biotech",
-    "Finland biotech",
-    "European biotech licensing deal",
+# ----------------------------
+# Endpoints News
+# Their /feed/ sometimes blocks bots.
+# We'll include multiple options and accept whichever works.
+# ----------------------------
+ENDPOINTS_FEEDS = [
+    # Primary (new domain)
+    "https://endpoints.news/feed/",
+
+    # Fallbacks (legacy domain feeds often still work for channels)
+    # Example found historically: https://endpts.com/channel/regulatory/feed/
+    "https://endpts.com/channel/deals/feed/",
+    "https://endpts.com/channel/financing/feed/",
+    "https://endpts.com/channel/regulatory/feed/",
+    "https://endpts.com/channel/clinical/feed/",
 ]
 
+# ----------------------------
+# Reuters/Bloomberg: fallback only (not “guaranteed”)
+# We'll pull headlines via Google News RSS.
+# ----------------------------
 def _google_news_rss_url(query: str) -> str:
+    # when:1d restricts to last day in Google News
     q = quote_plus(f"{query} when:1d")
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
-FEEDS = BASE_FEEDS + [_google_news_rss_url(q) for q in GOOGLE_NEWS_QUERIES]
+FALLBACK_GOOGLE_QUERIES = [
+    # Reuters
+    "site:reuters.com biotech acquisition",
+    "site:reuters.com pharma deal",
+    "site:reuters.com FDA approval biotech",
+    "site:reuters.com EMA approval drug",
+
+    # Bloomberg
+    "site:bloomberg.com biotech acquisition",
+    "site:bloomberg.com pharma deal",
+    "site:bloomberg.com FDA approval biotech",
+]
+
+GOOGLE_FEEDS = [_google_news_rss_url(q) for q in FALLBACK_GOOGLE_QUERIES]
+
+FEEDS = DIRECT_FEEDS + ENDPOINTS_FEEDS + GOOGLE_FEEDS
 
 
 # ----------------------------
@@ -74,7 +103,7 @@ def _debug(*args):
 
 
 # ----------------------------
-# Parsing helpers
+# Text + datetime helpers
 # ----------------------------
 def _clean_text(s: str) -> str:
     s = html.unescape(s or "")
@@ -83,10 +112,6 @@ def _clean_text(s: str) -> str:
 
 
 def _parse_dt(dt_str: str | None) -> datetime | None:
-    """
-    Parse common RSS/Atom datetime strings.
-    Returns timezone-aware UTC datetime, or None if parsing fails.
-    """
     if not dt_str:
         return None
     dt_str = dt_str.strip()
@@ -112,9 +137,7 @@ def _parse_dt(dt_str: str | None) -> datetime | None:
 
 
 def _get_text(elem: ET.Element, tag_names: list[str]) -> str | None:
-    """
-    Get text for first matching child tag name (namespace-safe by suffix).
-    """
+    # Namespace-safe search by suffix
     for child in list(elem):
         suffix = child.tag.split("}")[-1] if "}" in child.tag else child.tag
         if suffix in tag_names:
@@ -123,18 +146,21 @@ def _get_text(elem: ET.Element, tag_names: list[str]) -> str | None:
     return None
 
 
+# ----------------------------
+# RSS/Atom parser
+# ----------------------------
 def _parse_rss_or_atom(xml_bytes: bytes) -> list[dict]:
     """
-    Parses RSS2 / Atom feeds.
+    Parses RSS2 / Atom.
     Returns list of {title, link, published_dt}
-    IMPORTANT: does NOT unwrap Google links here (too slow). That is done later lazily.
+    (No Google unwrapping here — we do that later lazily)
     """
     root = ET.fromstring(xml_bytes)
     root_tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
 
     items: list[dict] = []
 
-    # ---------- RSS ----------
+    # RSS
     if root_tag.lower() == "rss":
         channel = root.find(".//{*}channel")
         if channel is None:
@@ -151,10 +177,9 @@ def _parse_rss_or_atom(xml_bytes: bytes) -> list[dict]:
 
             if title and link:
                 items.append({"title": title, "link": link, "published_dt": published_dt})
-
         return items
 
-    # ---------- Atom ----------
+    # Atom
     for entry in root.findall(".//{*}entry"):
         title = _get_text(entry, ["title"]) or ""
         pub = _get_text(entry, ["published", "updated"])
@@ -179,7 +204,10 @@ def _parse_rss_or_atom(xml_bytes: bytes) -> list[dict]:
     return items
 
 
-def _fetch_feed(url: str, timeout_s: int = 25) -> list[dict]:
+# ----------------------------
+# Fetcher
+# ----------------------------
+def _fetch_feed(url: str, timeout_s: int = REQUEST_TIMEOUT_S) -> list[dict]:
     headers = {
         "User-Agent": UA,
         "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
@@ -216,12 +244,11 @@ def _dedupe(items: list[dict]) -> list[dict]:
 
 
 # ----------------------------
-# Google News unwrapping (LAZY)
+# Google News unwrapping (lazy)
 # ----------------------------
 def _unwrap_google_news(url: str, timeout_s: int = 10) -> str:
     """
-    Try to turn a Google News wrapper URL into the publisher URL.
-    We keep it best-effort and fast.
+    Best-effort to turn Google News wrapper into publisher URL.
     """
     if "news.google.com" not in (url or ""):
         return url
@@ -235,7 +262,7 @@ def _unwrap_google_news(url: str, timeout_s: int = 10) -> str:
     try:
         r = requests.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
 
-        # If redirects got us off Google, done
+        # Redirects got us off Google
         final = (r.url or "").strip()
         if final and "news.google.com" not in final:
             return final
@@ -260,9 +287,6 @@ def _unwrap_google_news(url: str, timeout_s: int = 10) -> str:
 
 
 def _unwrap_some_google_links(items: list[dict], max_unwrap: int) -> list[dict]:
-    """
-    Unwrap ONLY the first N Google News links to avoid hundreds of extra requests.
-    """
     if max_unwrap <= 0:
         return items
 
@@ -282,17 +306,12 @@ def _unwrap_some_google_links(items: list[dict], max_unwrap: int) -> list[dict]:
 # ----------------------------
 # Public API
 # ----------------------------
-def fetch_last_24h(limit_per_feed: int = 40) -> list[dict]:
+def fetch_last_24h(limit_per_feed: int = PER_FEED_LIMIT) -> list[dict]:
     """
-    Returns list of:
-      { "title": str, "link": str, "published_dt": datetime|None }
-
-    Date filter:
-      - If published_dt parsed and < cutoff => drop
-      - If no published_dt => keep (avoid losing items due to parsing issues)
-
-    Google unwrapping:
-      - Done lazily on top N items only (cap via GOOGLE_UNWRAP_CAP)
+    Returns list of {title, link, published_dt}
+    - Drops items older than 24h IF they have a parsed published_dt
+    - Keeps undated items (some feeds are missing dates)
+    - Unwraps some Google News links (Reuters/Bloomberg fallback)
     """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=24)
@@ -323,7 +342,7 @@ def fetch_last_24h(limit_per_feed: int = 40) -> list[dict]:
 
     _debug("After 24h filter:", len(recent_items))
 
-    # ✅ Lazy unwrap only some Google links to keep runtime stable
+    # Only unwrap a limited number to avoid timeouts
     recent_items = _unwrap_some_google_links(recent_items, GOOGLE_UNWRAP_CAP)
 
     return recent_items
