@@ -134,11 +134,12 @@ def _parse_rss_or_atom(xml_bytes: bytes) -> list[dict]:
     items: list[dict] = []
 
     if root_tag.lower() == "rss":
-        channel = root.find("./channel")
+        # Namespace-safe search
+        channel = root.find(".//{*}channel")
         if channel is None:
             return []
 
-        for item in channel.findall("./item"):
+        for item in channel.findall(".//{*}item"):
             title = _get_text(item, ["title"]) or ""
             link = _get_text(item, ["link"]) or ""
             pub = _get_text(item, ["pubDate", "date", "published", "updated"])
@@ -149,7 +150,6 @@ def _parse_rss_or_atom(xml_bytes: bytes) -> list[dict]:
 
             if title and link:
                 items.append({"title": title, "link": link, "published_dt": published_dt})
-
     else:
         # Atom usually: <feed><entry>...
         # entries may have <link href="..."/>
