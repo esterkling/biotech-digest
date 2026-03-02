@@ -1,5 +1,6 @@
 # digest.py
 import os
+import re
 from datetime import datetime
 from dateutil import tz
 
@@ -69,6 +70,55 @@ def is_ipo_category(ai_category: str) -> bool:
 
 
 # -----------------------
+# Deal staleness / recap detection (heuristic, free)
+# -----------------------
+_RESURFACED_PHRASES = [
+    "previously announced",
+    "was announced",
+    "announced last week",
+    "following last week's announcement",
+    "earlier this week",
+    "earlier this month",
+    "last month",
+    "last week",
+    "weeks ago",
+    "previously disclosed",
+    "already announced",
+    "reiterated",
+    "recap",
+    "in a note",
+    "analysis",
+    "what it means",
+    "explainer",
+    "background",
+    "context",
+]
+
+# e.g. "announced on Feb. 27" / "announced on February 27"
+_ANNOUNCED_ON_DATE_RE = re.compile(
+    r"\bannounced\s+on\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\.?\s+\d{1,2}\b",
+    re.IGNORECASE,
+)
+
+def is_resurfaced_deal(text: str) -> bool:
+    """
+    Returns True if the article snippet strongly suggests it is discussing
+    an earlier-announced deal rather than reporting a newly announced one.
+    """
+    if not text:
+        return False
+    t = text.lower()
+
+    if any(p in t for p in _RESURFACED_PHRASES):
+        return True
+
+    if _ANNOUNCED_ON_DATE_RE.search(text):
+        return True
+
+    return False
+
+
+# -----------------------
 # EDGAR enrichment (IPO only)
 # -----------------------
 def edgar_for_ipo(title: str, user_agent: str) -> dict:
@@ -134,17 +184,25 @@ def build_clusters(raw_items: list[dict]) -> tuple[list[dict], dict[int, list[in
     return reps, rep_to_other_ids
 
 
-def build_structured(reps: list[dict], snippet_chars: int = 1200, max_items: int = 25) -> dict[int, dict]:
+def build_structured(
+    reps: list[dict],
+    snippet_chars: int = 1400,
+    max_items: int = 30,
+) -> tuple[dict[int, dict], dict[int, str]]:
     """
     One batch call: categorization + one-line summary + VC takeaway.
+    Also returns snippet_by_id so we can apply "resurfaced deal" heuristics without refetching.
     """
     reps = reps[:max_items]
     extract_input = []
+    snippet_by_id: dict[int, str] = {}
 
     for r in reps:
-        txt = extract_article_text(r["url"])
-        snippet = (txt or "").strip().replace("\n", " ")
+        txt = extract_article_text(r["url"]) or ""
+        snippet = txt.strip().replace("\n", " ")
         snippet = snippet[:snippet_chars]
+
+        snippet_by_id[r["id"]] = snippet
 
         extract_input.append(
             {
@@ -158,7 +216,9 @@ def build_structured(reps: list[dict], snippet_chars: int = 1200, max_items: int
 
     out = ai_extract_structured(extract_input)
     items = out.get("items", [])
-    return {int(x["id"]): x for x in items if isinstance(x, dict) and "id" in x}
+    structured_by_id = {int(x["id"]): x for x in items if isinstance(x, dict) and "id" in x}
+
+    return structured_by_id, snippet_by_id
 
 
 # -----------------------
@@ -175,9 +235,9 @@ def build_digest_text() -> str:
     reps, rep_to_others = build_clusters(raw_items)
 
     # B) AI categorize + summarize + VC takeaway (batch)
-    structured_by_id = build_structured(reps)
+    structured_by_id, snippet_by_id = build_structured(reps)
 
-    # Bucket by AI category
+    # Bucket order
     bucket_order = [
         "IPOs/Public markets",
         "Financings",
@@ -190,10 +250,22 @@ def build_digest_text() -> str:
     ]
     buckets = {k: [] for k in bucket_order}
 
+    # We'll store deal-recap items separately
+    resurfaced_deals: list[dict] = []
+
+    # Score for Top 3
     scored = []
-    for r in reps[:25]:
+    for r in reps[:30]:
         s = structured_by_id.get(r["id"], {})
         cat = s.get("category", "Other")
+
+        # --- NEW: Stale/recap filter for M&A/Licensing ---
+        if cat == "M&A/Licensing":
+            snip = snippet_by_id.get(r["id"], "")
+            if is_resurfaced_deal(snip):
+                resurfaced_deals.append(r)
+                continue
+
         if cat not in buckets:
             cat = "Other"
         buckets[cat].append(r)
@@ -282,6 +354,7 @@ def build_digest_text() -> str:
                 except Exception:
                     lines.append("  ↳ EDGAR enrichment unavailable.")
 
+            # Also covered by
             other_ids = rep_to_others.get(r["id"], [])
             if other_ids:
                 alt_urls = []
@@ -295,6 +368,21 @@ def build_digest_text() -> str:
 
         lines.append("")
 
+    # NEW: Deal recaps / resurfaced items section
+    if resurfaced_deals:
+        lines.append("*📌 Earlier but resurfaced (deal recap / analysis)*")
+        for r in resurfaced_deals[:10]:
+            s = structured_by_id.get(r["id"], {})
+            summary = (s.get("one_line_summary") or "").strip()
+            takeaway = (s.get("vc_takeaway") or "").strip()
+            lines.append(f"• {slack_link(r['url'], r['title'])}")
+            if summary:
+                lines.append(f"  ↳ {summary}")
+            if takeaway:
+                # Label it as recap so it doesn't read like "new deal"
+                lines.append(f"  ↳ *VC Takeaway (recap lens):* {takeaway}")
+        lines.append("")
+
     return "\n".join(lines).strip()
 
 
@@ -304,7 +392,7 @@ def main():
         print("Not 08:00 Stockholm time and FORCE_SEND not set; exiting.")
         return
 
-    # Required env vars (fail fast with clear error)
+    # Required env vars (fail fast)
     _ = os.environ["SLACK_WEBHOOK_URL"]
     _ = os.environ["SEC_USER_AGENT"]
     _ = os.environ["GROQ_API_KEY"]
