@@ -9,8 +9,7 @@ from typing import Any, Dict, List
 import requests
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-# Free-tier friendly + fast. You can change to a larger model later.
-MODEL = "llama-3.1-8b-instant"
+MODEL = "llama-3.1-8b-instant"  # free-tier friendly
 
 
 # ----------------------------
@@ -35,17 +34,12 @@ def _groq_chat(
     def _post() -> requests.Response:
         return requests.post(
             f"{GROQ_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=payload,
             timeout=timeout_s,
         )
 
     r = _post()
-
-    # Free tiers can rate limit. Back off once and retry.
     if r.status_code == 429:
         time.sleep(3)
         r = _post()
@@ -56,17 +50,16 @@ def _groq_chat(
 
 def _parse_json_strict(text: str) -> Any:
     """
-    Models sometimes return extra preamble. This extracts the first JSON object/array.
+    Models sometimes return extra text before/after JSON.
+    This extracts the first JSON object/array.
     """
     text = (text or "").strip()
 
-    # 1) Try direct parse
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # 2) Extract first {...} or [...]
     start = None
     for i, ch in enumerate(text):
         if ch in "{[":
@@ -83,8 +76,7 @@ def _parse_json_strict(text: str) -> Any:
     if end is None or end <= start:
         raise ValueError(f"No JSON end found in model response: {text[:200]}")
 
-    candidate = text[start:end]
-    return json.loads(candidate)
+    return json.loads(text[start:end])
 
 
 # ----------------------------
@@ -93,13 +85,8 @@ def _parse_json_strict(text: str) -> Any:
 def ai_cluster_headlines(items: List[Dict[str, str]]) -> Dict[str, Any]:
     """
     Input items: [{id:int, title:str, url:str, source:str}, ...]
-    Returns:
-      {
-        "clusters":[
-          {"cluster_id":1, "item_ids":[0,3,7], "representative_id":0, "label":"..."},
-          ...
-        ]
-      }
+    Output:
+      {"clusters":[{"cluster_id":1,"item_ids":[...],"representative_id":...,"label":"..."}]}
     """
     system = {"role": "system", "content": "Return valid JSON only. No markdown."}
     user = {
@@ -117,7 +104,6 @@ def ai_cluster_headlines(items: List[Dict[str, str]]) -> Dict[str, Any]:
     txt = _groq_chat([system, user], max_tokens=1600, temperature=0.0)
     data = _parse_json_strict(txt)
 
-    # Minimal validation / normalization
     clusters = data.get("clusters") if isinstance(data, dict) else None
     if not isinstance(clusters, list):
         return {"clusters": []}
@@ -147,56 +133,30 @@ def ai_cluster_headlines(items: List[Dict[str, str]]) -> Dict[str, Any]:
 # ----------------------------
 def ai_extract_structured(items: List[Dict[str, str]]) -> Dict[str, Any]:
     """
-    Input items: [{id:int, title:str, url:str, source:str, snippet:str}, ...]
+    Input: [{id,title,url,source,snippet},...]
 
-    Output JSON:
-    {
-      "items":[
-        {
-          "id": int,
-          "category": one of [
-            "Financings","IPOs/Public markets","M&A/Licensing","Clinical readouts/Safety",
-            "FDA/EMA Regulatory","Pharma/Big biotech","Nordic/European biotech","Other"
-          ],
-          "companies":[...],
-          "counterparties":[...],
-          "event_type": "...",
-          "amounts": {"upfront": "...", "total": "...", "raise": "..."} ,
-          "stage": "...",
-          "indication": "...",
-          "modality_or_target": "...",
-          "phase": "...",
-          "regulator": "...",
-          "geography": "...",
-          "materiality": "low|medium|high",
-          "one_line_summary": "...",
-          "vc_takeaway": "..."
-        },...
-      ]
-    }
+    Output:
+      {"items":[{id, category, one_line_summary, vc_takeaway, materiality, ...}, ...]}
     """
     system = {"role": "system", "content": "Return valid JSON only. No markdown."}
     user = {
         "role": "user",
         "content": (
             "You are preparing a biotech VC morning digest.\n"
-            "For each item, extract structured fields from the TITLE + SNIPPET (snippet may be empty).\n"
-            "Do NOT invent facts not supported by the snippet/title. If unknown, use null or empty.\n\n"
+            "For each item, extract structured fields from TITLE + SNIPPET (snippet may be empty).\n"
+            "Do NOT invent facts not supported by snippet/title. If unknown, use null/empty.\n\n"
             "Return JSON only with schema {items:[...]}.\n"
             "Categories must be one of:\n"
             "Financings; IPOs/Public markets; M&A/Licensing; Clinical readouts/Safety; "
             "FDA/EMA Regulatory; Pharma/Big biotech; Nordic/European biotech; Other\n\n"
             "Rules:\n"
-            "- 'materiality' should reflect VC relevance (big deals/approvals/readouts/public co. actions => high).\n"
-            "- 'one_line_summary' must be 1 sentence.\n"
-            "- 'vc_takeaway' must be 1 sharp sentence.\n\n"
+            "- materiality: low/medium/high (VC relevance)\n"
+            "- one_line_summary: exactly 1 sentence\n"
+            "- vc_takeaway: exactly 1 sharp sentence\n\n"
             "Items:\n"
             + "\n\n".join(
                 [
-                    f"ID: {it['id']}\n"
-                    f"SOURCE: {it.get('source','')}\n"
-                    f"TITLE: {it['title']}\n"
-                    f"SNIPPET: {it.get('snippet','')}"
+                    f"ID: {it['id']}\nSOURCE: {it.get('source','')}\nTITLE: {it['title']}\nSNIPPET: {it.get('snippet','')}"
                     for it in items
                 ]
             )
@@ -262,37 +222,71 @@ def ai_extract_structured(items: List[Dict[str, str]]) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Backwards-compatible single-item helper
+# Compatibility single-item helper
 # ----------------------------
 def ai_summarize_takeaway(title: str, url: str, category: str, article_text: str) -> dict:
     """
-    Compatibility wrapper for older digest.py versions that expect:
-      {"summary": "...", "vc_takeaway": "...", "materiality": "..."}
-    Uses ai_extract_structured() on one item.
+    Backwards compatible wrapper: returns summary + vc_takeaway + materiality.
     """
     snippet = (article_text or "").strip().replace("\n", " ")
     snippet = snippet[:1200]
 
     out = ai_extract_structured(
-        [
-            {
-                "id": 0,
-                "title": title,
-                "url": url,
-                "source": "",
-                "snippet": snippet,
-            }
-        ]
+        [{"id": 0, "title": title, "url": url, "source": "", "snippet": snippet}]
     )
-
     items = out.get("items", [])
     if not items:
         return {"summary": "", "vc_takeaway": "", "materiality": "medium"}
 
     x = items[0]
-    # Prefer "one_line_summary", fallback to empty
     return {
         "summary": (x.get("one_line_summary") or "").strip(),
         "vc_takeaway": (x.get("vc_takeaway") or "").strip(),
         "materiality": (x.get("materiality") or "medium").strip(),
     }
+
+
+# ----------------------------
+# IPO / EDGAR AI parser (needed by src/edgar.py)
+# ----------------------------
+def ai_parse_edgar_last_private_round(filing_text: str, context: dict) -> dict:
+    """
+    Parse an S-1/F-1/424B4 excerpt and identify the last private preferred financing round price/share.
+    Returns:
+      {
+        last_private_round_price_per_share: number|null,
+        currency: "USD",
+        round_date: string|null,
+        security: string|null,
+        supporting_quote: string,
+        confidence: 0..1,
+        reasoning: string
+      }
+    """
+    system = {"role": "system", "content": "Return valid JSON only. No markdown."}
+    user = {
+        "role": "user",
+        "content": f"""
+You are reading an IPO registration statement excerpt (S-1/F-1/424B4).
+Goal: identify the LAST private preferred financing round price per share (not option exercises, not conversions unless clearly the priced round).
+
+Return STRICT JSON with keys:
+- last_private_round_price_per_share (number or null)
+- currency ("USD" if unknown)
+- round_date (string or null)
+- security (string or null)  // e.g. "Series C Preferred"
+- supporting_quote (string)  // exact quote used (<= 40 words)
+- confidence (number from 0 to 1)
+- reasoning (string) // 1 short sentence
+
+If not enough info, set price to null and lower confidence.
+
+Context (may be partial): {json.dumps(context)}
+
+Filing text (may be truncated):
+\"\"\"{(filing_text or '')[:9000]}\"\"\"
+""".strip(),
+    }
+
+    txt = _groq_chat([system, user], max_tokens=700, temperature=0.1)
+    return _parse_json_strict(txt)
