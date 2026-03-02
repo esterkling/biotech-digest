@@ -16,9 +16,9 @@ def should_run_now_stockholm() -> bool:
 
 def main():
     # Run twice/day in Actions; only post once at 08:00 Stockholm time
-    if not should_run_now_stockholm():
-        print("Not 08:00 Stockholm time, exiting.")
-        return
+    #if not should_run_now_stockholm():
+    #   print("Not 08:00 Stockholm time, exiting.")
+    #    return
 
     ua = os.environ["SEC_USER_AGENT"]
     slack_url = os.environ["SLACK_WEBHOOK_URL"]
